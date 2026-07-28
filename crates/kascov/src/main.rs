@@ -2093,6 +2093,7 @@ async fn serve(
         .route("/data/{network}/token/{id}", get(token_handler))
         .route("/data/{network}/consistency.json", get(consistency_handler))
         .route("/data/{network}/events", get(events_handler))
+        .route("/data/{network}/stream-info.json", get(stream_info_handler))
         .route("/data/{network}/coins", get(coins_handler))
         .route("/data/{network}/activity.json", get(activity_handler))
         .route("/data/{network}/addr/{address}", get(addr_handler))
@@ -4302,22 +4303,158 @@ async fn data_handler(
     .await
 }
 
-/// Feed page ceiling and the size of a bare (param-less) request.
+/// Durable delivery page ceiling and the size of a bare request.
 const EVENTS_MAX_PAGE: u64 = 1000;
 const EVENTS_DEFAULT_PAGE: u64 = 200;
 
-/// GET /data/{network}/events?after_daa=&after_seq=&limit= — the chain-wide
-/// event feed, canonical event objects in their canonical deterministic order
-/// (accepting_daa, tx_index NULLS LAST, txid), oldest first. Cursor mirrors
-/// the grid's conventions: when more rows remain the response carries
-/// `next_after_daa`/`next_after_seq` — feed them back verbatim to keep
-/// walking. `after_seq` counts events already consumed inside the `after_daa`
-/// group (see Store::events_after for why that offset is stable).
+#[derive(Clone, Debug)]
+struct EventsRequest {
+    after: Option<kascov_core::StreamCursor>,
+    limit: u64,
+    filter: kascov_core::store_delivery::DeliveryFilter,
+}
+
+fn parse_events_request(
+    query: &std::collections::HashMap<String, String>,
+) -> std::result::Result<EventsRequest, &'static str> {
+    if query.contains_key("after_daa") || query.contains_key("after_seq") {
+        return Err("DAA cursors are unsupported; use after=<epoch>:<sequence>");
+    }
+    let after = query
+        .get("after")
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| "after must be an opaque <epoch>:<sequence> cursor")?;
+    let limit = match query.get("limit") {
+        None => EVENTS_DEFAULT_PAGE,
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| "limit must be a positive integer")?
+            .clamp(1, EVENTS_MAX_PAGE),
+    };
+    let filter = stream::delivery_filter(query)?;
+    Ok(EventsRequest {
+        after,
+        limit,
+        filter,
+    })
+}
+
+#[derive(Debug)]
+enum EventsPageError {
+    ForeignEpoch(kascov_core::store_delivery::DeliveryStreamInfo),
+    Ahead(kascov_core::store_delivery::DeliveryStreamInfo),
+    Store(kascov_core::Error),
+}
+
+impl From<kascov_core::Error> for EventsPageError {
+    fn from(error: kascov_core::Error) -> Self {
+        Self::Store(error)
+    }
+}
+
+fn events_page_json(
+    store: &Store,
+    network: Network,
+    request: &EventsRequest,
+) -> std::result::Result<serde_json::Value, EventsPageError> {
+    use kascov_core::store_delivery::DeliveryCursorPosition;
+
+    let info = store.delivery_stream_info()?;
+    if let Some(after) = request.after {
+        match info.classify(after) {
+            DeliveryCursorPosition::Valid => {}
+            DeliveryCursorPosition::ForeignEpoch => {
+                return Err(EventsPageError::ForeignEpoch(info))
+            }
+            DeliveryCursorPosition::Ahead => return Err(EventsPageError::Ahead(info)),
+        }
+    }
+    let start = request.after.unwrap_or(kascov_core::StreamCursor {
+        epoch: info.current.epoch,
+        seq: 0,
+    });
+    let mut events = store.delivery_page_filtered(
+        Some(start),
+        request.limit.saturating_add(1),
+        &request.filter,
+    )?;
+    let has_more = events.len() as u64 > request.limit;
+    if has_more {
+        events.truncate(request.limit as usize);
+    }
+    let page_end = events.last().map_or(start, |event| event.cursor);
+    let current = if page_end.seq > info.current.seq {
+        page_end
+    } else {
+        info.current
+    };
+    let next = if has_more { page_end } else { current };
+    Ok(serde_json::json!({
+        "network": network.to_string(),
+        "generated_at_ms": now_ms(),
+        "after": start,
+        "next": next,
+        "has_more": has_more,
+        "earliest": info.earliest,
+        "current": current,
+        "history_start_daa": info.history_start_daa,
+        "order_complete": info.order_complete,
+        "events": events,
+    }))
+}
+
+fn stream_info_json(store: &Store, network: Network) -> Result<serde_json::Value> {
+    let info = store.delivery_stream_info()?;
+    Ok(serde_json::json!({
+        "network": network.to_string(),
+        "generated_at_ms": now_ms(),
+        "earliest": info.earliest,
+        "current": info.current,
+        "history_start_daa": info.history_start_daa,
+        "order_complete": info.order_complete,
+    }))
+}
+
+fn uncached_json(value: serde_json::Value) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    use axum::response::IntoResponse;
+
+    let mut response = axum::Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn cursor_reset_response(
+    network: Network,
+    reason: &'static str,
+    info: kascov_core::store_delivery::DeliveryStreamInfo,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    (
+        StatusCode::CONFLICT,
+        axum::Json(serde_json::json!({
+            "error": "cursor_reset",
+            "reason": reason,
+            "current": info.current,
+            "earliest": info.earliest,
+            "snapshot": format!("/data/{network}.json"),
+        })),
+    )
+        .into_response()
+}
+
+/// GET /data/{network}/events?after=<cursor>&limit=<bounded> reads the durable
+/// delivery log in global cursor order. Optional identity filters are
+/// `covenant`, `application`, `artifact`, and `actor`.
 async fn events_handler(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
     axum::extract::Path(net_name): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -4325,70 +4462,233 @@ async fn events_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    // Same contract as the grid: a bad cursor degrades to the stream start,
-    // an unparseable limit is a 400 (a silently ignored limit would serve a
-    // page size the caller asked not to get).
-    let after_daa = q
-        .get("after_daa")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let after_seq = q
-        .get("after_seq")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let limit = match q.get("limit") {
-        None => EVENTS_DEFAULT_PAGE,
-        Some(s) => match s.parse::<u64>() {
-            Ok(l) => l.clamp(1, EVENTS_MAX_PAGE),
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    "limit must be a non-negative integer",
-                )
-                    .into_response()
-            }
-        },
+    let request = match parse_events_request(&q) {
+        Ok(request) => request,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let db = state.base_dir.join(format!("{network}.db"));
-    let key = format!("{network}/events?after_daa={after_daa}&after_seq={after_seq}&limit={limit}");
-    let cc = "public, max-age=10, s-maxage=15, stale-while-revalidate=60";
-    serve_cached(&state, key, 15, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        // Over-fetch by one to learn whether another page exists.
-        let mut events = store.events_after(after_daa, after_seq, limit + 1)?;
-        let more = events.len() as u64 > limit;
-        if more {
-            events.truncate(limit as usize);
-        }
-        let next = events.last().filter(|_| more).map(|last| {
-            let in_group = events
-                .iter()
-                .filter(|e| e.accepting_daa == last.accepting_daa)
-                .count() as u64;
-            (
-                last.accepting_daa,
-                if last.accepting_daa == after_daa {
-                    after_seq + in_group
-                } else {
-                    in_group
-                },
-            )
-        });
-        let tip = store.tip()?;
-        let mut out = serde_json::json!({
-            "network": network.to_string(),
-            "generated_at_ms": now_ms(),
-            "tip_daa": tip.map(|t| t.0),
-            "tip_at_ms": tip.map(|t| t.1),
-            "events": events,
-        });
-        if let Some((daa, seq)) = next {
-            out["next_after_daa"] = serde_json::json!(daa);
-            out["next_after_seq"] = serde_json::json!(seq);
-        }
-        Ok(Some(serde_json::to_string(&out)?))
+    match tokio::task::spawn_blocking(move || {
+        let store = kascov_core::store::Store::open_read_only(&db, network)?;
+        events_page_json(&store, network, &request)
+
     })
     .await
+    {
+        Ok(Ok(value)) => uncached_json(value),
+        Ok(Err(EventsPageError::ForeignEpoch(info))) => {
+            cursor_reset_response(network, "foreign_epoch", info)
+        }
+        Ok(Err(EventsPageError::Ahead(info))) => {
+            cursor_reset_response(network, "ahead", info)
+        }
+        Ok(Err(EventsPageError::Store(error))) => {
+            tracing::error!("{network}: durable event page failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "events unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: durable event page task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+/// GET /data/{network}/stream-info.json exposes the durable cursor bounds and
+/// migration completeness needed before a client selects its initial cursor.
+async fn stream_info_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path(net_name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let network = match resolve_network(&state, &net_name) {
+        Ok(network) => network,
+        Err(response) => return response,
+    };
+    let db = state.base_dir.join(format!("{network}.db"));
+    match tokio::task::spawn_blocking(move || {
+        let store = Store::open_read_only(&db, network)?;
+        stream_info_json(&store, network)
+    })
+    .await
+    {
+        Ok(Ok(value)) => uncached_json(value),
+        Ok(Err(error)) => {
+            tracing::error!("{network}: stream info failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "stream info unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: stream info task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod durable_events_tests {
+    use super::*;
+    use kascov_core::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent};
+    use kascov_core::{
+        ApplicationOutput, ApplicationPreprocess, BlockHash, CovenantId, StreamCursor,
+        StreamEpoch, TxId,
+    };
+
+    fn batch(index: u8) -> AcceptedBlockBatch {
+        let covenant_id = CovenantId([index; 32]);
+        let txid = TxId([index.saturating_add(10); 32]);
+        AcceptedBlockBatch {
+            accepting_block: BlockHash([index; 32]),
+            accepting_daa: u64::from(index) * 100,
+            accepting_time_ms: u64::from(index) * 1_000,
+            accepting_blue_score: u64::from(index) * 100,
+            events: vec![NewEvent {
+                covenant_id,
+                kind: EventKind::Genesis,
+                txid,
+                tx_index: 0,
+                event_index: 0,
+                payload: None,
+                lane_namespace: None,
+            }],
+            created_utxos: vec![],
+            spent_utxos: vec![],
+            transactions: vec![AcceptedTransaction {
+                txid,
+                application: ApplicationPreprocess {
+                    outputs: vec![ApplicationOutput {
+                        output_index: 0,
+                        covenant_id,
+                        application_id: "duel".into(),
+                        artifact_id: [0xdd; 32],
+                        actor_path: format!("Match.Player{index}"),
+                        state_json: "{}".into(),
+                    }],
+                    ..Default::default()
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn event_query_parses_bounds_filters_and_clean_cutoff() {
+        let mut query = std::collections::HashMap::new();
+        query.insert("limit".into(), "9999".into());
+        query.insert("covenant".into(), "ab".repeat(32));
+        query.insert("application".into(), "duel".into());
+        query.insert("artifact".into(), "cd".repeat(32));
+        query.insert("actor".into(), "Match.Player1".into());
+        let request = parse_events_request(&query).unwrap();
+        assert_eq!(EVENTS_MAX_PAGE, request.limit);
+        assert_eq!(Some(CovenantId([0xab; 32])), request.filter.covenant_id);
+        assert_eq!(Some([0xcd; 32]), request.filter.artifact_id);
+
+        query.insert("after_daa".into(), "1".into());
+        assert!(parse_events_request(&query).is_err());
+        query.remove("after_daa");
+        query.insert("after".into(), "bad".into());
+        assert!(parse_events_request(&query).is_err());
+    }
+
+    #[test]
+    fn event_pages_cover_empty_history_pagination_filters_and_cursor_bounds() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-event-handler-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let empty = events_page_json(
+            &store,
+            Network::Testnet(10),
+            &EventsRequest {
+                after: None,
+                limit: 2,
+                filter: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(Some(0), empty["events"].as_array().map(Vec::len));
+        assert_eq!(empty["after"], empty["current"]);
+        assert!(empty["earliest"].is_null());
+
+        for index in 1..=3 {
+            store.apply_accepted_block(&batch(index)).unwrap();
+        }
+        let first = events_page_json(
+            &store,
+            Network::Testnet(10),
+            &EventsRequest {
+                after: None,
+                limit: 2,
+                filter: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(2, first["events"].as_array().unwrap().len());
+        assert_eq!(Some(true), first["has_more"].as_bool());
+        let next: StreamCursor = serde_json::from_value(first["next"].clone()).unwrap();
+        let second = events_page_json(
+            &store,
+            Network::Testnet(10),
+            &EventsRequest {
+                after: Some(next),
+                limit: 2,
+                filter: Default::default(),
+            },
+        )
+        .unwrap();
+        assert_eq!(1, second["events"].as_array().unwrap().len());
+        assert_eq!(Some(false), second["has_more"].as_bool());
+
+        let filtered = events_page_json(
+            &store,
+            Network::Testnet(10),
+            &EventsRequest {
+                after: None,
+                limit: 10,
+                filter: kascov_core::store_delivery::DeliveryFilter {
+                    actor_path: Some("Match.Player2".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(1, filtered["events"].as_array().unwrap().len());
+        assert_eq!(filtered["next"], filtered["current"]);
+
+        let current = store.delivery_high_water().unwrap();
+        let ahead = EventsRequest {
+            after: Some(StreamCursor {
+                epoch: current.epoch,
+                seq: current.seq + 1,
+            }),
+            limit: 1,
+            filter: Default::default(),
+        };
+        assert!(matches!(
+            events_page_json(&store, Network::Testnet(10), &ahead),
+            Err(EventsPageError::Ahead(_))
+        ));
+        let foreign = EventsRequest {
+            after: Some(StreamCursor {
+                epoch: StreamEpoch([0xff; 16]),
+                seq: 0,
+            }),
+            limit: 1,
+            filter: Default::default(),
+        };
+        assert!(matches!(
+            events_page_json(&store, Network::Testnet(10), &foreign),
+            Err(EventsPageError::ForeignEpoch(_))
+        ));
+
+        let discovery = stream_info_json(&store, Network::Testnet(10)).unwrap();
+        assert_eq!(discovery["current"], second["current"]);
+        assert!(discovery["history_start_daa"].is_u64());
+        assert!(discovery["order_complete"].is_boolean());
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Ceiling on one batch-summary request.
@@ -7728,7 +8028,8 @@ async fn data_index_handler(
         "endpoints": {
             "snapshot": format!("/data/{n}.json"),
             "live": format!("/data/{n}-live.json"),
-            "events": format!("/data/{n}/events?after_daa=&after_seq=&limit="),
+            "events": format!("/data/{n}/events?after=&limit=&covenant=&application=&artifact=&actor="),
+            "stream_info": format!("/data/{n}/stream-info.json"),
             "coin": format!("/data/{n}/c/{{covenant_id}}.json"),
             "coins_batch": format!("/data/{n}/coins?ids="),
             "tx": format!("/data/{n}/tx/{{txid}}.json"),

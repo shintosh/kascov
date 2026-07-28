@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::delivery::{DeliveryRecord, StreamCursor, StreamEpoch};
 use crate::store::Store;
-use crate::{BlockHash, Error, Result};
+use crate::{BlockHash, CovenantId, Error, Result};
 
 const DELIVERY_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS delivery_log (
@@ -323,6 +323,41 @@ pub struct DeliveryMigrationProgress {
     pub order_complete: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveryFilter {
+    pub covenant_id: Option<CovenantId>,
+    pub application_id: Option<String>,
+    pub artifact_id: Option<[u8; 32]>,
+    pub actor_path: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryCursorPosition {
+    Valid,
+    ForeignEpoch,
+    Ahead,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DeliveryStreamInfo {
+    pub earliest: Option<StreamCursor>,
+    pub current: StreamCursor,
+    pub history_start_daa: u64,
+    pub order_complete: bool,
+}
+
+impl DeliveryStreamInfo {
+    pub fn classify(&self, cursor: StreamCursor) -> DeliveryCursorPosition {
+        if cursor.epoch != self.current.epoch {
+            DeliveryCursorPosition::ForeignEpoch
+        } else if cursor.seq > self.current.seq {
+            DeliveryCursorPosition::Ahead
+        } else {
+            DeliveryCursorPosition::Valid
+        }
+    }
+}
+
 impl Store {
     pub fn backfill_delivery_batch(
         &mut self,
@@ -510,6 +545,15 @@ impl Store {
         after: Option<StreamCursor>,
         limit: u64,
     ) -> Result<Vec<DeliveryRecord>> {
+        self.delivery_page_filtered(after, limit, &DeliveryFilter::default())
+    }
+
+    pub fn delivery_page_filtered(
+        &self,
+        after: Option<StreamCursor>,
+        limit: u64,
+        filter: &DeliveryFilter,
+    ) -> Result<Vec<DeliveryRecord>> {
         let epoch = self.stream_epoch()?;
         if let Some(cursor) = after {
             if cursor.epoch != epoch {
@@ -520,17 +564,39 @@ impl Store {
             }
         }
         let after_seq = after.map_or(0, |cursor| cursor.seq);
+        let covenant_id = filter.covenant_id.map(|id| id.0.to_vec());
+        let artifact_id = filter.artifact_id.map(|id| id.to_vec());
         let mut statement = self
             .conn
             .prepare(
-                "SELECT data_json FROM delivery_log
-                 WHERE stream_seq > ?1 ORDER BY stream_seq LIMIT ?2",
+                "SELECT delivery_log.data_json FROM delivery_log
+                 WHERE delivery_log.stream_seq > ?1
+                   AND (?2 IS NULL OR delivery_log.covenant_id = ?2)
+                   AND (
+                       (?3 IS NULL AND ?4 IS NULL AND ?5 IS NULL)
+                       OR EXISTS (
+                           SELECT 1 FROM delivery_applications
+                           WHERE delivery_applications.stream_seq = delivery_log.stream_seq
+                             AND (?3 IS NULL OR delivery_applications.application_id = ?3)
+                             AND (?4 IS NULL OR delivery_applications.artifact_id = ?4)
+                             AND (?5 IS NULL OR delivery_applications.actor_path = ?5)
+                       )
+                   )
+                 ORDER BY delivery_log.stream_seq LIMIT ?6",
             )
             .map_err(db_err)?;
         let rows = statement
-            .query_map(params![after_seq, limit.clamp(1, 1000)], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![
+                    after_seq,
+                    covenant_id,
+                    filter.application_id.as_deref(),
+                    artifact_id,
+                    filter.actor_path.as_deref(),
+                    limit.clamp(1, 1001),
+                ],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(db_err)?
             .map(|row| {
                 let json = row.map_err(db_err)?;
@@ -541,6 +607,62 @@ impl Store {
             })
             .collect();
         rows
+    }
+
+    pub fn delivery_stream_info(&self) -> Result<DeliveryStreamInfo> {
+        let (epoch, next, earliest, history_start_daa, order_complete) = self
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT value FROM meta WHERE key = 'stream_epoch'),
+                    (SELECT value FROM meta WHERE key = 'next_stream_seq'),
+                    (SELECT MIN(stream_seq) FROM delivery_log),
+                    (SELECT value FROM meta WHERE key = 'delivery_history_start_daa'),
+                    (SELECT value FROM meta WHERE key = 'delivery_history_order_complete')",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<u64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(db_err)?;
+        let epoch = StreamEpoch::from_str(&epoch)?;
+        let next = next.parse::<u64>().map_err(|_| Error::Invalid {
+            what: "next_stream_seq",
+            value: next,
+        })?;
+        let current = StreamCursor {
+            epoch,
+            seq: next.checked_sub(1).ok_or_else(|| Error::Invalid {
+                what: "next stream sequence",
+                value: next.to_string(),
+            })?,
+        };
+        let history_start_daa = history_start_daa.parse().map_err(|_| Error::Invalid {
+            what: "delivery_history_start_daa",
+            value: history_start_daa,
+        })?;
+        let order_complete = match order_complete.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => {
+                return Err(Error::Invalid {
+                    what: "delivery_history_order_complete",
+                    value: order_complete,
+                })
+            }
+        };
+        Ok(DeliveryStreamInfo {
+            earliest: earliest.map(|seq| StreamCursor { epoch, seq }),
+            current,
+            history_start_daa,
+            order_complete,
+        })
     }
 
     pub fn delivery_backfill_complete(&self) -> Result<bool> {
@@ -585,6 +707,7 @@ fn db_err(error: rusqlite::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use crate::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent, NewUtxo, Store};
+    use super::{DeliveryCursorPosition, DeliveryFilter};
     use crate::{
         ApplicationOutput, ApplicationPreprocess, BlockHash, CovenantId, DeliveryKind,
         DecodeFailure, DeliveryRecord, Network, Outpoint, StreamCursor, StreamEpoch, TxId,
@@ -763,6 +886,88 @@ mod tests {
                 10,
             )
             .is_err());
+    }
+
+    #[test]
+    fn delivery_pages_filter_without_changing_the_global_cursor() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-delivery-filter-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let first = store.apply_accepted_block(&accepted_batch(1, 2)).unwrap();
+        let second = store.apply_accepted_block(&accepted_batch(2, 3)).unwrap();
+        let first_cursor = first.deliveries[0].cursor;
+        let second_cursor = second.deliveries[0].cursor;
+
+        for filter in [
+            DeliveryFilter {
+                covenant_id: Some(CovenantId([1; 32])),
+                ..Default::default()
+            },
+            DeliveryFilter {
+                application_id: Some("counter".into()),
+                ..Default::default()
+            },
+            DeliveryFilter {
+                artifact_id: Some([2; 32]),
+                ..Default::default()
+            },
+            DeliveryFilter {
+                actor_path: Some("Counter".into()),
+                ..Default::default()
+            },
+        ] {
+            let page = store
+                .delivery_page_filtered(Some(first_cursor), 10, &filter)
+                .unwrap();
+            assert_eq!(vec![second_cursor], page.iter().map(|row| row.cursor).collect::<Vec<_>>());
+        }
+        assert!(store
+            .delivery_page_filtered(
+                None,
+                10,
+                &DeliveryFilter {
+                    application_id: Some("missing".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn delivery_stream_info_classifies_cursor_bounds() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-delivery-info-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let empty = store.delivery_stream_info().unwrap();
+        assert_eq!(None, empty.earliest);
+        assert_eq!(0, empty.current.seq);
+
+        let committed = store.apply_accepted_block(&accepted_batch(1, 2)).unwrap();
+        let info = store.delivery_stream_info().unwrap();
+        assert_eq!(Some(committed.deliveries[0].cursor), info.earliest);
+        assert_eq!(committed.deliveries[0].cursor, info.current);
+        assert_eq!(DeliveryCursorPosition::Valid, info.classify(info.current));
+        assert_eq!(
+            DeliveryCursorPosition::Ahead,
+            info.classify(StreamCursor {
+                epoch: info.current.epoch,
+                seq: info.current.seq + 1,
+            })
+        );
+        assert_eq!(
+            DeliveryCursorPosition::ForeignEpoch,
+            info.classify(StreamCursor {
+                epoch: StreamEpoch([0xff; 16]),
+                seq: 0,
+            })
+        );
     }
 
     #[test]

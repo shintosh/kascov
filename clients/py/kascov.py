@@ -110,6 +110,35 @@ class Kascov:
         """Recent chain reorgs the indexer rolled back through."""
         return self._get(f"/data/{self.network}/reorgs.json")
 
+    def stream_info(self) -> Dict[str, Any]:
+        """Durable delivery bounds for snapshot-to-stream handoff."""
+        return self._get(f"/data/{self.network}/stream-info.json")
+
+    def events(
+        self,
+        after: Optional[str] = None,
+        limit: Optional[int] = None,
+        covenant: Optional[str] = None,
+        application: Optional[str] = None,
+        artifact: Optional[str] = None,
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Read one durable delivery page in global cursor order."""
+        q = {
+            key: value
+            for key, value in {
+                "after": after,
+                "limit": limit,
+                "covenant": covenant,
+                "application": application,
+                "artifact": artifact,
+                "actor": actor,
+            }.items()
+            if value is not None
+        }
+        suffix = f"?{urllib.parse.urlencode(q)}" if q else ""
+        return self._get(f"/data/{self.network}/events{suffix}")
+
     def templates(self) -> Dict[str, Any]:
         """Contract-type analytics (what's running on this network)."""
         return self._get(f"/data/{self.network}/templates.json")

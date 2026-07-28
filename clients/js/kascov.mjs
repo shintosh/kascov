@@ -88,6 +88,20 @@ export class Kascov {
   /** Recent chain reorgs the indexer rolled back through. */
   reorgs() { return this.#get(`/data/${this.network}/reorgs.json`); }
 
+  /** Durable delivery bounds for snapshot-to-stream handoff. */
+  streamInfo() { return this.#get(`/data/${this.network}/stream-info.json`); }
+
+  /** One durable delivery page in global cursor order.
+      opts: { after, limit, covenant, application, artifact, actor }. */
+  events(opts = {}) {
+    const q = new URLSearchParams();
+    for (const [key, value] of Object.entries(opts)) {
+      if (value != null) q.set(key, value);
+    }
+    const suffix = q.toString();
+    return this.#get(`/data/${this.network}/events${suffix ? `?${suffix}` : ''}`);
+  }
+
   /** Contract-type analytics (what's running on this network). */
   templates() { return this.#get(`/data/${this.network}/templates.json`); }
 
