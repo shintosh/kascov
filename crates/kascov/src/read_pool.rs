@@ -8,6 +8,7 @@ use kascov_core::store::Store;
 
 use crate::performance::ReadPoolMetrics;
 
+#[cfg(test)]
 pub const DEFAULT_MAX_READERS: u32 = 8;
 pub const DEFAULT_CHECKOUT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -79,8 +80,13 @@ impl std::fmt::Display for ReadError {
 impl std::error::Error for ReadError {}
 
 impl ReadPool {
+    #[cfg(test)]
     pub fn new(path: &Path, network: Network) -> Self {
-        Self::with_limits(path, network, DEFAULT_MAX_READERS, DEFAULT_CHECKOUT_TIMEOUT)
+        Self::with_max_size(path, network, DEFAULT_MAX_READERS)
+    }
+
+    pub fn with_max_size(path: &Path, network: Network, max_size: u32) -> Self {
+        Self::with_limits(path, network, max_size, DEFAULT_CHECKOUT_TIMEOUT)
     }
 
     fn with_limits(path: &Path, network: Network, max_size: u32, timeout: Duration) -> Self {
@@ -168,6 +174,13 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(20));
         assert_eq!(1, pool.inner.state().connections);
         drop(held);
+    }
+
+    #[test]
+    fn configured_pool_size_is_applied() {
+        let (_directory, path, network) = initialized_store();
+        let pool = ReadPool::with_max_size(&path, network, 4);
+        assert_eq!(4, pool.inner.max_size());
     }
 
     #[test]

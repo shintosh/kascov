@@ -37,7 +37,29 @@ const CHECKPOINT_EVERY: u64 = 500;
 /// Accepting blocks fetched ahead while earlier ones are processed. Keeps
 /// catch-up throughput above the chain's block rate (fetches are WAN-bound;
 /// TN10 alone produces ~10 blocks/s).
-const FETCH_AHEAD: usize = 16;
+pub const DEFAULT_FETCH_AHEAD: usize = 16;
+static FETCH_AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub fn configure_fetch_ahead(value: usize) -> Result<()> {
+    if value == 0 {
+        return Err(crate::Error::Invalid {
+            what: "accepted fetch-ahead",
+            value: value.to_string(),
+        });
+    }
+    match FETCH_AHEAD.set(value) {
+        Ok(()) => Ok(()),
+        Err(value) if FETCH_AHEAD.get() == Some(&value) => Ok(()),
+        Err(value) => Err(crate::Error::Invalid {
+            what: "accepted fetch-ahead reconfiguration",
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn fetch_ahead() -> usize {
+    FETCH_AHEAD.get().copied().unwrap_or(DEFAULT_FETCH_AHEAD)
+}
 
 /// Process all virtual chain changes since the stored cursor (or `from`, or the
 /// current sink for a fresh index). Returns once caught up.
@@ -156,7 +178,7 @@ pub async fn sync_once_measured_with_decoder(
             let block = node.block_with_txs(accepted.accepting_block).await;
             (accepted, block)
         })
-        .buffered(FETCH_AHEAD);
+        .buffered(fetch_ahead());
 
     while let Some((accepted, block)) = prefetched.next().await {
         stats.chain_blocks += 1;
@@ -782,7 +804,7 @@ pub async fn recover_gap(
                 let block = node.block_with_txs(accepted.accepting_block).await;
                 (accepted, block)
             })
-            .buffered(FETCH_AHEAD);
+            .buffered(fetch_ahead());
 
         while let Some((accepted, block)) = prefetched.next().await {
             report.chain_blocks_walked += 1;

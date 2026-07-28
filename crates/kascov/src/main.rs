@@ -9,6 +9,7 @@ mod read_pool;
 mod preflight;
 mod registry;
 mod stream;
+mod tuning;
 mod witness;
 
 use api::*;
@@ -155,11 +156,20 @@ enum Command {
         #[arg(long, default_value_t = stream::DEFAULT_MAX_REPLAYS)]
         max_replays: usize,
         /// Durable records read in each historical replay query.
-        #[arg(long, default_value_t = stream::DEFAULT_REPLAY_PAGE_SIZE)]
+        #[arg(long, default_value_t = tuning::DEFAULT_REPLAY_PAGE)]
         replay_page_size: u64,
         /// Maximum durable records in one JSON event page.
         #[arg(long, default_value_t = stream::DEFAULT_EVENT_PAGE_SIZE)]
         event_page_size: u64,
+        /// Accepted blocks fetched ahead during ordered reconciliation.
+        #[arg(long, default_value_t = tuning::DEFAULT_FETCH_AHEAD)]
+        fetch_ahead: usize,
+        /// SQLite WAL pages between automatic checkpoints.
+        #[arg(long, default_value_t = tuning::DEFAULT_WAL_AUTOCHECKPOINT)]
+        wal_autocheckpoint: u32,
+        /// Read-only SQLite connections per network.
+        #[arg(long, default_value_t = tuning::DEFAULT_READ_POOL)]
+        read_pool: u32,
     },
     /// Write a consistent copy of the index database (safe while syncing).
     Backup {
@@ -218,7 +228,9 @@ async fn main() -> Result<()> {
             max_replays,
             replay_page_size,
             event_page_size,
-
+            fetch_ahead,
+            wal_autocheckpoint,
+            read_pool,
         } => {
             serve(
                 &cli,
@@ -232,7 +244,12 @@ async fn main() -> Result<()> {
                     replay_page_size,
                     event_page_size,
                 },
-
+                tuning::TuningProfile {
+                    fetch_ahead,
+                    wal_autocheckpoint,
+                    read_pool,
+                    replay_page: replay_page_size,
+                },
             )
             .await
         }
@@ -1610,6 +1627,7 @@ struct ServeState {
     read_pools: Vec<(Network, read_pool::ReadPool)>,
     max_events: u64,
     capacity: stream::CapacityLimits,
+    tuning: tuning::TuningProfile,
     /// Node url for the custodial deploy endpoint (None → public resolver).
     rpc: Option<String>,
     /// Rate limiter shared by the custodial /deploy endpoint.
@@ -1877,10 +1895,13 @@ async fn serve(
     db_dir: Option<std::path::PathBuf>,
     max_events: u64,
     capacity: stream::CapacityLimits,
+    tuning: tuning::TuningProfile,
 ) -> Result<()> {
     use axum::routing::{get, post};
 
     let capacity = capacity.validate()?;
+    let tuning = tuning.validate()?;
+    tuning.configure_core()?;
     let networks: Vec<Network> = networks
         .split(',')
         .map(|s| s.trim().parse())
@@ -1918,7 +1939,10 @@ async fn serve(
             delivery_high_water: std::sync::atomic::AtomicU64::new(0),
         });
         let db = base_dir.join(format!("{network}.db"));
-        read_pools.push((network, read_pool::ReadPool::new(&db, network)));
+        read_pools.push((
+            network,
+            read_pool::ReadPool::with_max_size(&db, network, tuning.read_pool),
+        ));
         // The pending poller opens its OWN read-only handle on the same file,
         // so hand it a separate path (the follower moves `db` below).
         let db_for_poller = db.clone();
@@ -1969,6 +1993,7 @@ async fn serve(
         read_pools,
         max_events,
         capacity,
+        tuning,
         rpc: cli.rpc.clone(),
         deploy_limiter: tokio::sync::Mutex::new(DeployLimiter::new()),
         tool_limiter: tokio::sync::Mutex::new(ToolLimiter::new()),
@@ -2353,6 +2378,7 @@ async fn healthz_handler(
                 "tx_index_backfill_done": backfill_done,
                 "mempool": mempool,
                 "capacity": capacity,
+                "tuning": state.tuning.health_json(),
                 "performance": performance,
             }),
         );

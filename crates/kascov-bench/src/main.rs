@@ -3,7 +3,57 @@ mod fixture;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+
+const FETCH_AHEAD: [usize; 4] = [8, 16, 32, 64];
+const WAL_AUTOCHECKPOINT: [u32; 3] = [1_000, 4_000, 16_000];
+const READ_POOL: [u32; 3] = [4, 8, 16];
+const REPLAY_PAGE: [u64; 3] = [256, 512, 1_024];
+
+#[derive(Args, Clone, Copy, Debug)]
+struct TuningArgs {
+    #[arg(long, default_value_t = 16)]
+    fetch_ahead: usize,
+    #[arg(long, default_value_t = 1_000)]
+    wal_autocheckpoint: u32,
+    #[arg(long, default_value_t = 8)]
+    read_pool: u32,
+    #[arg(long, default_value_t = 512)]
+    replay_page: u64,
+}
+
+impl TuningArgs {
+    fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            FETCH_AHEAD.contains(&self.fetch_ahead),
+            "invalid fetch-ahead candidate"
+        );
+        anyhow::ensure!(
+            WAL_AUTOCHECKPOINT.contains(&self.wal_autocheckpoint),
+            "invalid wal-autocheckpoint candidate"
+        );
+        anyhow::ensure!(
+            READ_POOL.contains(&self.read_pool),
+            "invalid read-pool candidate"
+        );
+        anyhow::ensure!(
+            REPLAY_PAGE.contains(&self.replay_page),
+            "invalid replay-page candidate"
+        );
+        Ok(self)
+    }
+
+    fn json(self) -> serde_json::Value {
+        serde_json::json!({
+            "profile_version": 0,
+            "profile_status": "initial",
+            "fetch_ahead": self.fetch_ahead,
+            "wal_autocheckpoint_pages": self.wal_autocheckpoint,
+            "read_pool_connections": self.read_pool,
+            "replay_page_records": self.replay_page,
+        })
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +75,8 @@ enum Command {
         events_per_block: u32,
         #[arg(long)]
         output: PathBuf,
+        #[command(flatten)]
+        tuning: TuningArgs,
     },
 }
 
@@ -34,6 +86,52 @@ fn main() -> Result<()> {
             blocks,
             events_per_block,
             output,
-        } => fixture::write_fixture_report(blocks, events_per_block, &output),
+            tuning,
+        } => {
+            let tuning = tuning.validate()?;
+            fixture::write_fixture_report(blocks, events_per_block, &output)?;
+            let mut report: serde_json::Value = serde_json::from_slice(&std::fs::read(&output)?)?;
+            report["tuning"] = tuning.json();
+            std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_candidates_and_initial_tuple_validate() {
+        let initial = TuningArgs {
+            fetch_ahead: 16,
+            wal_autocheckpoint: 1_000,
+            read_pool: 8,
+            replay_page: 512,
+        };
+        assert!(initial.validate().is_ok());
+        assert_eq!(0, initial.json()["profile_version"]);
+
+        for invalid in [
+            TuningArgs {
+                fetch_ahead: 7,
+                ..initial
+            },
+            TuningArgs {
+                wal_autocheckpoint: 999,
+                ..initial
+            },
+            TuningArgs {
+                read_pool: 3,
+                ..initial
+            },
+            TuningArgs {
+                replay_page: 255,
+                ..initial
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
     }
 }

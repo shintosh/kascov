@@ -968,6 +968,33 @@ pub(crate) fn db_err(e: rusqlite::Error) -> Error {
     Error::Rpc(format!("store: {e}"))
 }
 
+pub const DEFAULT_WAL_AUTOCHECKPOINT: u32 = 1_000;
+static WAL_AUTOCHECKPOINT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+pub fn configure_wal_autocheckpoint(pages: u32) -> Result<()> {
+    if pages == 0 {
+        return Err(Error::Invalid {
+            what: "WAL auto-checkpoint pages",
+            value: pages.to_string(),
+        });
+    }
+    match WAL_AUTOCHECKPOINT.set(pages) {
+        Ok(()) => Ok(()),
+        Err(pages) if WAL_AUTOCHECKPOINT.get() == Some(&pages) => Ok(()),
+        Err(pages) => Err(Error::Invalid {
+            what: "WAL auto-checkpoint reconfiguration",
+            value: pages.to_string(),
+        }),
+    }
+}
+
+fn wal_autocheckpoint() -> u32 {
+    WAL_AUTOCHECKPOINT
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_WAL_AUTOCHECKPOINT)
+}
+
 /// Milliseconds since the Unix epoch (wall clock). Used to timestamp reorg-log
 /// rows; a backwards clock only yields a smaller number, never a panic.
 fn now_ms() -> u64 {
@@ -1278,6 +1305,9 @@ impl Store {
             )
             .map_err(db_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(db_err)?;
+        conn.pragma_update(None, "wal_autocheckpoint", wal_autocheckpoint())
+            .map_err(db_err)?;
             .map_err(db_err)?;
         // Concurrent readers (backup, serve snapshots) must wait out write
         // bursts instead of failing with SQLITE_BUSY.
@@ -6241,6 +6271,16 @@ mod tests {
         let path = test_store_path("fresh-allow-missing");
         Store::open(&path, Network::Testnet(10)).expect("Allow creates");
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn writer_uses_the_configured_wal_autocheckpoint_default() {
+        let store = test_store("wal-autocheckpoint");
+        let pages: u32 = store
+            .conn
+            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
+            .unwrap();
+        assert_eq!(DEFAULT_WAL_AUTOCHECKPOINT, pages);
     }
 
     #[test]

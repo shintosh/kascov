@@ -2,7 +2,8 @@ use super::*;
 
 pub(super) const DEFAULT_MAX_STREAMS: usize = 512;
 pub(super) const DEFAULT_MAX_REPLAYS: usize = 32;
-pub(super) const DEFAULT_REPLAY_PAGE_SIZE: u64 = 512;
+#[cfg(test)]
+pub(super) const DEFAULT_REPLAY_PAGE_SIZE: u64 = crate::tuning::DEFAULT_REPLAY_PAGE;
 pub(super) const DEFAULT_EVENT_PAGE_SIZE: u64 = 1_000;
 pub(super) const MAX_STREAM_REQUEST_BYTES: usize = 4 * 1024;
 pub(super) const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
@@ -20,11 +21,10 @@ impl CapacityLimits {
     pub fn validate(self) -> anyhow::Result<Self> {
         if self.max_streams == 0
             || self.max_replays == 0
-            || self.replay_page_size == 0
-            || self.replay_page_size > u64::from(u16::MAX)
+            || !crate::tuning::REPLAY_PAGE_CANDIDATES.contains(&self.replay_page_size)
             || self.event_page_size == 0
         {
-            anyhow::bail!("stream capacity values must be positive and replay-page-size must fit u16");
+            anyhow::bail!("stream capacity values are invalid or replay-page-size is not a fixed candidate");
         }
         Ok(self)
     }
@@ -735,6 +735,9 @@ mod tests {
             .validate()
             .is_err());
         assert!(CapacityLimits { replay_page_size: u64::from(u16::MAX) + 1, ..test_limits() }
+            .validate()
+            .is_err());
+        assert!(CapacityLimits { replay_page_size: 300, ..test_limits() }
             .validate()
             .is_err());
         assert!(CapacityLimits { event_page_size: 0, ..test_limits() }
