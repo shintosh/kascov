@@ -862,6 +862,7 @@ impl AcceptedBlockBatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedTransaction {
     pub txid: TxId,
+    pub transaction: crate::Transaction,
     pub application: crate::ApplicationPreprocess,
 }
 
@@ -870,7 +871,11 @@ impl AcceptedTransaction {
         tx: &crate::Transaction,
         decoder: &(impl crate::ApplicationDecoder + ?Sized),
     ) -> Self {
-        Self { txid: tx.txid, application: decoder.preprocess(tx) }
+        Self {
+            txid: tx.txid,
+            transaction: tx.clone(),
+            application: decoder.preprocess(tx),
+        }
     }
 }
 

@@ -101,13 +101,13 @@ impl FromStr for Network {
 }
 
 /// Covenant binding on a transaction output (KIP-20).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CovenantBinding {
     pub covenant_id: CovenantId,
     pub authorizing_input: u16,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Output {
     pub value: u64,
     pub spk_version: u16,
@@ -116,7 +116,7 @@ pub struct Output {
     pub covenant: Option<CovenantBinding>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Input {
     pub previous_outpoint: Outpoint,
     /// The unlocking script — for P2SH spends its final push reveals the
@@ -128,7 +128,7 @@ pub struct Input {
     pub compute_budget: u16,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     pub txid: TxId,
     pub version: u16,

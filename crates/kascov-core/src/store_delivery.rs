@@ -748,6 +748,13 @@ mod tests {
             spent_utxos: vec![],
             transactions: vec![AcceptedTransaction {
                 txid,
+                transaction: crate::Transaction {
+                    txid,
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![],
+                    payload: b"ARGI".to_vec(),
+                },
                 application: ApplicationPreprocess {
                     raw_envelope: Some(b"ARGI".to_vec()),
                     application_payload: Some(b"move".to_vec()),

@@ -246,6 +246,38 @@ impl PendingFeed {
         })
     }
 
+    pub(super) fn application_snapshot_json_at(
+        &self,
+        application_id: &str,
+        generated_at_ms: u64,
+    ) -> serde_json::Value {
+        let mut snapshot = self.snapshot_json_at(generated_at_ms);
+        if let Some(rows) = snapshot["pending"].as_array_mut() {
+            rows.retain(|row| {
+                row.pointer("/application/outputs")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|outputs| {
+                        outputs.iter().any(|output| {
+                            output.get("application_id").and_then(serde_json::Value::as_str)
+                                == Some(application_id)
+                        })
+                    })
+                    || row
+                        .pointer("/application/failures")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|failures| {
+                            failures.iter().any(|failure| {
+                                failure
+                                    .get("application_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(application_id)
+                            })
+                        })
+            });
+        }
+        snapshot
+    }
+
     pub(super) fn health_json_at(&self, generated_at_ms: u64) -> serde_json::Value {
         serde_json::json!({
             "status": self.status_at(generated_at_ms),
@@ -789,6 +821,37 @@ mod pending_feed_tests {
             CovenantId([0x22; 32]).to_string()
         );
         assert_eq!(row["events"][1]["tx_kind"], "burn");
+    }
+
+    #[test]
+    fn application_pending_snapshot_keeps_only_matching_transactions() {
+        let mut feed = PendingFeed::new();
+        for (byte, application_id) in [(1, "duel"), (2, "counter")] {
+            let txid = TxId([byte; 32]);
+            feed.insert_at(
+                txid,
+                CovenantId([byte; 32]),
+                EventKind::Transition,
+                0,
+                1_000,
+                std::time::Instant::now(),
+                vec![],
+                kascov_core::ApplicationPreprocess {
+                    outputs: vec![kascov_core::ApplicationOutput {
+                        output_index: 0,
+                        covenant_id: CovenantId([byte; 32]),
+                        application_id: application_id.into(),
+                        artifact_id: [3; 32],
+                        actor_path: "Match".into(),
+                        state_json: "{}".into(),
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let snapshot = feed.application_snapshot_json_at("duel", 1_100);
+        assert_eq!(1, snapshot["pending"].as_array().unwrap().len());
+        assert_eq!(TxId([1; 32]).to_string(), snapshot["pending"][0]["txid"]);
     }
 
     #[test]

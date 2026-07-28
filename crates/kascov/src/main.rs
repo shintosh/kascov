@@ -166,6 +166,11 @@ enum Command {
         #[arg(long, default_value_t = 1_000)]
         batch_size: u64,
     },
+    /// Re-run approved Argent decoding from stored accepted transactions.
+    RepairArgent {
+        #[arg(long, default_value_t = 1_000)]
+        batch_size: u64,
+    },
 }
 
 #[tokio::main]
@@ -310,6 +315,30 @@ it has never been spent, or the index has not walked the spend yet"
                     }
                     break;
                 }
+            }
+            Ok(())
+        }
+        Command::RepairArgent { batch_size } => {
+            if cli.argent_manifest.is_none()
+                && std::env::var_os("KASCOV_ARGENT_MANIFEST").is_none()
+            {
+                anyhow::bail!("repair-argent requires --argent-manifest or KASCOV_ARGENT_MANIFEST");
+            }
+            let decoder = application_decoder(&cli)?;
+            let mut store = open_store(&cli)?;
+            let result = store.repair_application_failures(decoder.as_ref(), batch_size)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                eprintln!(
+                    "{}: scanned {}, repaired {} outputs and {} failures, appended {} deliveries; {} failures remain",
+                    cli.network,
+                    result.transactions_scanned,
+                    result.outputs_repaired,
+                    result.failures_repaired,
+                    result.deliveries_appended,
+                    result.failures_remaining,
+                );
             }
             Ok(())
         }
@@ -2094,6 +2123,14 @@ async fn serve(
         .route("/data/{network}/consistency.json", get(consistency_handler))
         .route("/data/{network}/events", get(events_handler))
         .route("/data/{network}/stream-info.json", get(stream_info_handler))
+        .route("/data/{network}/apps/{application}/state", get(application_state_handler))
+        .route("/data/{network}/apps/{application}/history", get(application_history_handler))
+        .route("/data/{network}/apps/{application}/failures", get(application_failures_handler))
+        .route("/data/{network}/apps/{application}/pending", get(application_pending_handler))
+        .route("/data/{network}/apps/{application}/tx/{txid}", get(application_transaction_handler))
+        .route("/data/{network}/apps/{application}/outpoint/{txid}/{index}", get(application_outpoint_handler))
+        .route("/data/{network}/apps/{application}/covenant/{covenant}", get(application_covenant_handler))
+        .route("/data/{network}/apps/{application}/actor/{*actor}", get(application_actor_handler))
         .route("/data/{network}/coins", get(coins_handler))
         .route("/data/{network}/activity.json", get(activity_handler))
         .route("/data/{network}/addr/{address}", get(addr_handler))
@@ -4557,6 +4594,13 @@ mod durable_events_tests {
             spent_utxos: vec![],
             transactions: vec![AcceptedTransaction {
                 txid,
+                transaction: kascov_core::Transaction {
+                    txid,
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![],
+                    payload: b"ARGI".to_vec(),
+                },
                 application: ApplicationPreprocess {
                     outputs: vec![ApplicationOutput {
                         output_index: 0,
@@ -4691,6 +4735,387 @@ mod durable_events_tests {
         assert!(discovery["order_complete"].is_boolean());
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+const APPLICATION_DEFAULT_PAGE: u64 = 100;
+const APPLICATION_MAX_PAGE: u64 = 500;
+
+fn validate_application_identity(value: &str) -> std::result::Result<(), &'static str> {
+    if value.is_empty() || value.len() > 128 {
+        return Err("application must be 1..=128 bytes");
+    }
+    Ok(())
+}
+
+fn application_page_params(
+    query: &std::collections::HashMap<String, String>,
+) -> std::result::Result<(u64, u64), &'static str> {
+    let after_id = query
+        .get("after_id")
+        .map(|value| value.parse())
+        .transpose()
+        .map_err(|_| "after_id must be a non-negative integer")?
+        .unwrap_or(0);
+    let limit = query
+        .get("limit")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| "limit must be a positive integer")?
+        .unwrap_or(APPLICATION_DEFAULT_PAGE)
+        .clamp(1, APPLICATION_MAX_PAGE);
+    Ok((after_id, limit))
+}
+
+fn application_response_json(
+    store: &Store,
+    network: Network,
+    application: &str,
+    data: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let stream = store.delivery_stream_info()?;
+    let projection = store.optional_projection_status()?;
+    let processed_daa = store.processed_daa()?;
+    let tip_daa = store.tip()?.map(|tip| tip.0);
+    Ok(serde_json::json!({
+        "network": network.to_string(),
+        "application": application,
+        "generated_at_ms": now_ms(),
+        "stream_epoch": stream.current.epoch,
+        "stream_cursor": stream.current,
+        "processed_daa": processed_daa,
+        "tip_daa": tip_daa,
+        "projection_cursor": projection.cursor,
+        "projection_lag": projection.lag,
+        "completeness": {
+            "history_start_daa": stream.history_start_daa,
+            "history_complete": store.delivery_backfill_complete()?,
+            "order_complete": stream.order_complete,
+        },
+        "freshness": {
+            "accepted_lag_daa": tip_daa.unwrap_or(0).saturating_sub(processed_daa.unwrap_or(0)),
+            "projection_lag": projection.lag,
+        },
+        "data": data,
+    }))
+}
+
+async fn application_rows_response(
+    state: std::sync::Arc<ServeState>,
+    net_name: String,
+    application: String,
+    query: std::collections::HashMap<String, String>,
+    route_actor: Option<String>,
+    route_covenant: Option<String>,
+    current_only: bool,
+    data_key: &'static str,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let network = match resolve_network(&state, &net_name) {
+        Ok(network) => network,
+        Err(response) => return response,
+    };
+    if let Err(message) = validate_application_identity(&application) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let (after_id, limit) = match application_page_params(&query) {
+        Ok(page) => page,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let actor = route_actor.or_else(|| query.get("actor").cloned());
+    if actor.as_ref().is_some_and(|actor| actor.is_empty() || actor.len() > 256) {
+        return (StatusCode::BAD_REQUEST, "actor must be 1..=256 bytes").into_response();
+    }
+    let covenant = match route_covenant.or_else(|| query.get("covenant").cloned()) {
+        Some(value) => match value.parse::<CovenantId>() {
+            Ok(covenant) => Some(covenant),
+            Err(_) => return (StatusCode::BAD_REQUEST, "covenant must be 64 hex characters").into_response(),
+        },
+        None => None,
+    };
+    let database = state.base_dir.join(format!("{network}.db"));
+    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        let store = Store::open_read_only(&database, network)?;
+        let mut rows = store.application_outputs_page(
+            &application,
+            actor.as_deref(),
+            covenant.as_ref(),
+            current_only,
+            after_id,
+            limit + 1,
+        )?;
+        let has_more = rows.len() as u64 > limit;
+        if has_more {
+            rows.truncate(limit as usize);
+        }
+        let next_after_id = rows.last().map_or(after_id, |row| row.id);
+        let mut data = serde_json::json!({
+            "has_more": has_more,
+            "next_after_id": next_after_id,
+        });
+        data[data_key] = serde_json::to_value(rows)?;
+        application_response_json(&store, network, &application, data)
+    })
+    .await
+    {
+        Ok(Ok(value)) => uncached_json(value),
+        Ok(Err(error)) => {
+            tracing::error!("{network}: application query failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "application data unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: application query task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn application_state_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((network, application)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    application_rows_response(state, network, application, query, None, None, true, "states").await
+}
+
+async fn application_history_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((network, application)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    application_rows_response(state, network, application, query, None, None, false, "history").await
+}
+
+async fn application_covenant_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((network, application, covenant)): axum::extract::Path<(String, String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    application_rows_response(
+        state,
+        network,
+        application,
+        query,
+        None,
+        Some(covenant),
+        true,
+        "states",
+    )
+    .await
+}
+
+async fn application_actor_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((network, application, actor)): axum::extract::Path<(String, String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    application_rows_response(
+        state,
+        network,
+        application,
+        query,
+        Some(actor),
+        None,
+        true,
+        "states",
+    )
+    .await
+}
+
+async fn application_failures_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((net_name, application)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let network = match resolve_network(&state, &net_name) {
+        Ok(network) => network,
+        Err(response) => return response,
+    };
+    if let Err(message) = validate_application_identity(&application) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let (after_id, limit) = match application_page_params(&query) {
+        Ok(page) => page,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let database = state.base_dir.join(format!("{network}.db"));
+    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        let store = Store::open_read_only(&database, network)?;
+        let mut failures = store.application_decode_failures_page(
+            Some(&application),
+            after_id,
+            limit + 1,
+        )?;
+        let has_more = failures.len() as u64 > limit;
+        if has_more {
+            failures.truncate(limit as usize);
+        }
+        let next_after_id = failures.last().map_or(after_id, |failure| failure.id);
+        application_response_json(
+            &store,
+            network,
+            &application,
+            serde_json::json!({
+                "failures": failures,
+                "has_more": has_more,
+                "next_after_id": next_after_id,
+            }),
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => uncached_json(value),
+        Ok(Err(error)) => {
+            tracing::error!("{network}: application failure query failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "application failures unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: application failure task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn application_pending_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((net_name, application)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let network = match resolve_network(&state, &net_name) {
+        Ok(network) => network,
+        Err(response) => return response,
+    };
+    if let Err(message) = validate_application_identity(&application) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let Some((_, feed)) = state.pending.iter().find(|(candidate, _)| *candidate == network) else {
+        return (StatusCode::NOT_FOUND, "unknown network").into_response();
+    };
+    let pending = feed
+        .lock()
+        .await
+        .application_snapshot_json_at(&application, now_ms());
+    let database = state.base_dir.join(format!("{network}.db"));
+    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        let store = Store::open_read_only(&database, network)?;
+        application_response_json(&store, network, &application, pending)
+    })
+    .await
+    {
+        Ok(Ok(value)) => uncached_json(value),
+        Ok(Err(error)) => {
+            tracing::error!("{network}: pending application query failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "pending application data unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: pending application task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn application_transaction_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((net_name, application, txid)): axum::extract::Path<(String, String, String)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let network = match resolve_network(&state, &net_name) {
+        Ok(network) => network,
+        Err(response) => return response,
+    };
+    if let Err(message) = validate_application_identity(&application) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let txid = match txid.parse::<TxId>() {
+        Ok(txid) => txid,
+        Err(_) => return (StatusCode::BAD_REQUEST, "txid must be 64 hex characters").into_response(),
+    };
+    let database = state.base_dir.join(format!("{network}.db"));
+    match tokio::task::spawn_blocking(move || -> Result<Option<serde_json::Value>> {
+        let store = Store::open_read_only(&database, network)?;
+        let Some(transaction) = store.application_transaction(&application, &txid)? else {
+            return Ok(None);
+        };
+        application_response_json(
+            &store,
+            network,
+            &application,
+            serde_json::to_value(transaction)?,
+        )
+        .map(Some)
+    })
+    .await
+    {
+        Ok(Ok(Some(value))) => uncached_json(value),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "application transaction not found").into_response(),
+        Ok(Err(error)) => {
+            tracing::error!("{network}: application transaction query failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "application transaction unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: application transaction task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn application_outpoint_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
+    axum::extract::Path((net_name, application, txid, index)): axum::extract::Path<(String, String, String, String)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let network = match resolve_network(&state, &net_name) {
+        Ok(network) => network,
+        Err(response) => return response,
+    };
+    if let Err(message) = validate_application_identity(&application) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let txid = match txid.parse::<TxId>() {
+        Ok(txid) => txid,
+        Err(_) => return (StatusCode::BAD_REQUEST, "txid must be 64 hex characters").into_response(),
+    };
+    let index = match index.parse::<u32>() {
+        Ok(index) => index,
+        Err(_) => return (StatusCode::BAD_REQUEST, "output index must be a non-negative integer").into_response(),
+    };
+    let database = state.base_dir.join(format!("{network}.db"));
+    match tokio::task::spawn_blocking(move || -> Result<Option<serde_json::Value>> {
+        let store = Store::open_read_only(&database, network)?;
+        let Some(output) = store.application_output_by_outpoint(&application, &txid, index)? else {
+            return Ok(None);
+        };
+        application_response_json(
+            &store,
+            network,
+            &application,
+            serde_json::to_value(output)?,
+        )
+        .map(Some)
+    })
+    .await
+    {
+        Ok(Ok(Some(value))) => uncached_json(value),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "application outpoint not found").into_response(),
+        Ok(Err(error)) => {
+            tracing::error!("{network}: application outpoint query failed: {error}");
+            (StatusCode::SERVICE_UNAVAILABLE, "application outpoint unavailable").into_response()
+        }
+        Err(error) => {
+            tracing::error!("{network}: application outpoint task failed: {error}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -8033,6 +8458,10 @@ async fn data_index_handler(
             "live": format!("/data/{n}-live.json"),
             "events": format!("/data/{n}/events?after=&limit=&covenant=&application=&artifact=&actor="),
             "stream_info": format!("/data/{n}/stream-info.json"),
+            "application_state": format!("/data/{n}/apps/{{application}}/state?after_id=&limit="),
+            "application_history": format!("/data/{n}/apps/{{application}}/history?after_id=&limit=&actor=&covenant="),
+            "application_pending": format!("/data/{n}/apps/{{application}}/pending"),
+            "application_failures": format!("/data/{n}/apps/{{application}}/failures?after_id=&limit="),
             "coin": format!("/data/{n}/c/{{covenant_id}}.json"),
             "coins_batch": format!("/data/{n}/coins?ids="),
             "tx": format!("/data/{n}/tx/{{txid}}.json"),
