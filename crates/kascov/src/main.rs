@@ -148,6 +148,18 @@ enum Command {
         db_dir: Option<std::path::PathBuf>,
         #[arg(long, default_value_t = 500)]
         max_events: u64,
+        /// Maximum live EventSource connections per network.
+        #[arg(long, default_value_t = stream::DEFAULT_MAX_STREAMS)]
+        max_streams: usize,
+        /// Maximum concurrent historical EventSource replays per network.
+        #[arg(long, default_value_t = stream::DEFAULT_MAX_REPLAYS)]
+        max_replays: usize,
+        /// Durable records read in each historical replay query.
+        #[arg(long, default_value_t = stream::DEFAULT_REPLAY_PAGE_SIZE)]
+        replay_page_size: u64,
+        /// Maximum durable records in one JSON event page.
+        #[arg(long, default_value_t = stream::DEFAULT_EVENT_PAGE_SIZE)]
+        event_page_size: u64,
     },
     /// Write a consistent copy of the index database (safe while syncing).
     Backup {
@@ -195,15 +207,18 @@ async fn main() -> Result<()> {
         Command::Trace { covenant_id } => trace(&cli, covenant_id),
         Command::InspectTx { txid } => inspect_tx(&cli, txid).await,
         Command::Watch => sync(&cli, None, true, true).await,
-        Command::Export {
-            ref out,
-            max_events,
-        } => export(&cli, out.clone(), max_events),
+        Command::Export { ref out, max_events } => export(&cli, out.clone(), max_events),
+
         Command::Serve {
             ref listen,
             ref networks,
             ref db_dir,
             max_events,
+            max_streams,
+            max_replays,
+            replay_page_size,
+            event_page_size,
+
         } => {
             serve(
                 &cli,
@@ -211,6 +226,13 @@ async fn main() -> Result<()> {
                 networks.clone(),
                 db_dir.clone(),
                 max_events,
+                stream::CapacityLimits {
+                    max_streams,
+                    max_replays,
+                    replay_page_size,
+                    event_page_size,
+                },
+
             )
             .await
         }
@@ -1587,6 +1609,7 @@ struct ServeState {
     /// One bounded, read-only SQLite pool per followed network.
     read_pools: Vec<(Network, read_pool::ReadPool)>,
     max_events: u64,
+    capacity: stream::CapacityLimits,
     /// Node url for the custodial deploy endpoint (None → public resolver).
     rpc: Option<String>,
     /// Rate limiter shared by the custodial /deploy endpoint.
@@ -1853,9 +1876,11 @@ async fn serve(
     networks: String,
     db_dir: Option<std::path::PathBuf>,
     max_events: u64,
+    capacity: stream::CapacityLimits,
 ) -> Result<()> {
     use axum::routing::{get, post};
 
+    let capacity = capacity.validate()?;
     let networks: Vec<Network> = networks
         .split(',')
         .map(|s| s.trim().parse())
@@ -1880,7 +1905,7 @@ async fn serve(
     let mut network_performance = Vec::with_capacity(networks.len());
     let mut read_pools = Vec::with_capacity(networks.len());
     for &network in &networks {
-        let delivery_hub = DeliveryHub::new();
+        let delivery_hub = DeliveryHub::new(capacity);
         let pending_hub = PendingHub::new();
         let pending_set = std::sync::Arc::new(tokio::sync::Mutex::new(PendingFeed::new()));
         let metrics = std::sync::Arc::new(kascov_core::performance::PerformanceMetrics::new());
@@ -1943,6 +1968,7 @@ async fn serve(
         networks,
         read_pools,
         max_events,
+        capacity,
         rpc: cli.rpc.clone(),
         deploy_limiter: tokio::sync::Mutex::new(DeployLimiter::new()),
         tool_limiter: tokio::sync::Mutex::new(ToolLimiter::new()),
@@ -2289,6 +2315,12 @@ async fn healthz_handler(
             .map(|(_, metrics)| performance::snapshot_json(metrics))
             .expect("every configured network has performance metrics");
         performance["read_pool"] = read_pool_for(&state, network).metrics().snapshot_json();
+        let capacity = state
+            .deliveries
+            .iter()
+            .find(|(candidate, _)| *candidate == network)
+            .map(|(_, hub)| hub.capacity_json(state.capacity))
+            .expect("every configured network has delivery capacity");
         let network_stalled = now.saturating_sub(last_ok) > HEALTHZ_STALL_MS
             || (lag.is_some_and(|l| l > kascov_core::sync::WEDGE_LAG_DAA)
                 && now.saturating_sub(last_progress) > HEALTHZ_STALL_MS);
@@ -2320,6 +2352,7 @@ async fn healthz_handler(
                 "delivery_high_water": delivery_high_water,
                 "tx_index_backfill_done": backfill_done,
                 "mempool": mempool,
+                "capacity": capacity,
                 "performance": performance,
             }),
         );
@@ -4381,8 +4414,7 @@ async fn data_handler(
     .await
 }
 
-/// Durable delivery page ceiling and the size of a bare request.
-const EVENTS_MAX_PAGE: u64 = 1000;
+/// Default durable delivery page size.
 const EVENTS_DEFAULT_PAGE: u64 = 200;
 
 #[derive(Clone, Debug)]
@@ -4394,6 +4426,7 @@ struct EventsRequest {
 
 fn parse_events_request(
     query: &std::collections::HashMap<String, String>,
+    max_page: u64,
 ) -> std::result::Result<EventsRequest, &'static str> {
     if query.contains_key("after_daa") || query.contains_key("after_seq") {
         return Err("DAA cursors are unsupported; use after=<epoch>:<sequence>");
@@ -4408,7 +4441,7 @@ fn parse_events_request(
         Some(value) => value
             .parse::<u64>()
             .map_err(|_| "limit must be a positive integer")?
-            .clamp(1, EVENTS_MAX_PAGE),
+            .clamp(1, max_page),
     };
     let filter = stream::delivery_filter(query)?;
     Ok(EventsRequest {
@@ -4495,10 +4528,29 @@ fn stream_info_json(store: &Store, network: Network) -> Result<serde_json::Value
 }
 
 fn uncached_json(value: serde_json::Value) -> axum::response::Response {
-    use axum::http::{header, HeaderValue};
+    use axum::http::{header, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
 
-    let mut response = axum::Json(value).into_response();
+    let bytes = match serde_json::to_vec(&value) {
+        Ok(bytes) if bytes.len() <= stream::MAX_JSON_RESPONSE_BYTES => bytes,
+        Ok(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                "JSON response exceeds the byte limit; request a smaller page",
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!("JSON response encoding failed: {error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    let mut response = (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        bytes,
+    )
+        .into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -4540,7 +4592,7 @@ async fn events_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let request = match parse_events_request(&q) {
+    let request = match parse_events_request(&q, state.capacity.event_page_size) {
         Ok(request) => request,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
@@ -4665,16 +4717,25 @@ mod durable_events_tests {
         query.insert("application".into(), "duel".into());
         query.insert("artifact".into(), "cd".repeat(32));
         query.insert("actor".into(), "Match.Player1".into());
-        let request = parse_events_request(&query).unwrap();
-        assert_eq!(EVENTS_MAX_PAGE, request.limit);
+        let request = parse_events_request(&query, stream::DEFAULT_EVENT_PAGE_SIZE).unwrap();
+        assert_eq!(stream::DEFAULT_EVENT_PAGE_SIZE, request.limit);
         assert_eq!(Some(CovenantId([0xab; 32])), request.filter.covenant_id);
         assert_eq!(Some([0xcd; 32]), request.filter.artifact_id);
 
         query.insert("after_daa".into(), "1".into());
-        assert!(parse_events_request(&query).is_err());
+        assert!(parse_events_request(&query, stream::DEFAULT_EVENT_PAGE_SIZE).is_err());
         query.remove("after_daa");
         query.insert("after".into(), "bad".into());
-        assert!(parse_events_request(&query).is_err());
+        assert!(parse_events_request(&query, stream::DEFAULT_EVENT_PAGE_SIZE).is_err());
+    }
+
+    #[test]
+    fn uncached_json_rejects_oversized_responses_with_retry_hint() {
+        let response = uncached_json(serde_json::json!({
+            "value": "x".repeat(stream::MAX_JSON_RESPONSE_BYTES),
+        }));
+        assert_eq!(axum::http::StatusCode::SERVICE_UNAVAILABLE, response.status());
+        assert_eq!("1", response.headers()[axum::http::header::RETRY_AFTER]);
     }
 
     #[test]

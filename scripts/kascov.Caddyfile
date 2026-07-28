@@ -14,7 +14,8 @@
 # that is true — it would black-hole the whole site.
 
 kascov.io, www.kascov.io {
-	encode zstd gzip
+	@not_stream not path /data/*/stream
+	encode @not_stream zstd gzip
 
 	# --- API + dynamic worker routes (mirror firebase.json rewrites) ---
 	# SSE must NOT be buffered — flush_interval -1 streams it.
@@ -22,6 +23,7 @@ kascov.io, www.kascov.io {
 	handle @stream {
 		reverse_proxy 127.0.0.1:8080 {
 			flush_interval -1
+			header_up Last-Event-ID {http.request.header.Last-Event-ID}
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 		}

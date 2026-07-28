@@ -1,8 +1,34 @@
 use super::*;
 
-/// Cap on concurrent SSE subscribers per network — extras are rejected with
-/// 503 and stay on the polling path.
-const MAX_STREAM_SUBSCRIBERS: usize = 512;
+pub(super) const DEFAULT_MAX_STREAMS: usize = 512;
+pub(super) const DEFAULT_MAX_REPLAYS: usize = 32;
+pub(super) const DEFAULT_REPLAY_PAGE_SIZE: u64 = 512;
+pub(super) const DEFAULT_EVENT_PAGE_SIZE: u64 = 1_000;
+pub(super) const MAX_STREAM_REQUEST_BYTES: usize = 4 * 1024;
+pub(super) const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_JSON_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CapacityLimits {
+    pub max_streams: usize,
+    pub max_replays: usize,
+    pub replay_page_size: u64,
+    pub event_page_size: u64,
+}
+
+impl CapacityLimits {
+    pub fn validate(self) -> anyhow::Result<Self> {
+        if self.max_streams == 0
+            || self.max_replays == 0
+            || self.replay_page_size == 0
+            || self.replay_page_size > u64::from(u16::MAX)
+            || self.event_page_size == 0
+        {
+            anyhow::bail!("stream capacity values must be positive and replay-page-size must fit u16");
+        }
+        Ok(self)
+    }
+}
 /// Committed records held per network before slow clients recover from the log.
 const DELIVERY_BUFFER: usize = 1024;
 /// Best-effort pending frames stay isolated from durable accepted delivery.
@@ -12,15 +38,49 @@ const PENDING_BUFFER: usize = 256;
 pub(super) struct DeliveryHub {
     pub(super) tx: tokio::sync::broadcast::Sender<std::sync::Arc<kascov_core::DeliveryRecord>>,
     subscribers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max_subscribers: usize,
+    replays: std::sync::Arc<tokio::sync::Semaphore>,
+    max_replays: usize,
 }
 
 impl DeliveryHub {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(limits: CapacityLimits) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(DELIVERY_BUFFER);
         Self {
             tx,
             subscribers: Default::default(),
+            max_subscribers: limits.max_streams,
+            replays: std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_replays)),
+            max_replays: limits.max_replays,
         }
+    }
+
+    fn try_subscribe(&self) -> Option<SubscriberSlot> {
+        use std::sync::atomic::Ordering;
+        let previous = self.subscribers.fetch_add(1, Ordering::AcqRel);
+        if previous >= self.max_subscribers {
+            self.subscribers.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(SubscriberSlot(self.subscribers.clone()))
+    }
+
+    fn try_replay(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.replays.clone().try_acquire_owned().ok()
+    }
+
+    pub(super) fn capacity_json(&self, limits: CapacityLimits) -> serde_json::Value {
+        serde_json::json!({
+            "max_streams": self.max_subscribers,
+            "active_streams": self.subscribers.load(std::sync::atomic::Ordering::Relaxed),
+            "max_historical_replays": self.max_replays,
+            "active_historical_replays": self.max_replays.saturating_sub(self.replays.available_permits()),
+            "replay_page_records": limits.replay_page_size,
+            "event_page_records": limits.event_page_size,
+            "max_request_bytes": MAX_STREAM_REQUEST_BYTES,
+            "max_stream_event_bytes": MAX_STREAM_EVENT_BYTES,
+            "max_json_response_bytes": MAX_JSON_RESPONSE_BYTES,
+        })
     }
 }
 
@@ -90,6 +150,21 @@ fn bounded_filter(
         });
     }
     Ok(Some(value.to_owned()))
+}
+
+fn stream_request_bytes(
+    params: &std::collections::HashMap<String, String>,
+    headers: &axum::http::HeaderMap,
+) -> usize {
+    let query_bytes = params
+        .iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()).saturating_add(2))
+        .sum::<usize>();
+    query_bytes.saturating_add(
+        headers
+            .get("last-event-id")
+            .map_or(0, |value| value.as_bytes().len()),
+    )
 }
 
 fn delivery_matches(
@@ -165,8 +240,9 @@ fn pending_matches(
         })
 }
 
-fn pending_sse_event(msg: &str) -> axum::response::sse::Event {
-    axum::response::sse::Event::default().data(msg)
+fn pending_sse_event(msg: &str) -> Option<axum::response::sse::Event> {
+    (msg.len() <= MAX_STREAM_EVENT_BYTES)
+        .then(|| axum::response::sse::Event::default().data(msg))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,8 +318,6 @@ fn apply_stream_headers(response: &mut axum::response::Response) {
     headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
 }
 
-const REPLAY_PAGE_SIZE: u64 = 512;
-
 enum StreamFrame {
     Delivery(std::sync::Arc<kascov_core::DeliveryRecord>),
     Checkpoint(kascov_core::StreamCursor),
@@ -254,6 +328,7 @@ struct ReplayState {
     cursor: kascov_core::StreamCursor,
     through: kascov_core::StreamCursor,
     last_emitted: kascov_core::StreamCursor,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct DurableStreamState {
@@ -264,6 +339,7 @@ struct DurableStreamState {
     performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
     read_pool: crate::read_pool::ReadPool,
     network: Network,
+    replay_page_size: u64,
     replay: Option<ReplayState>,
     discard_through: kascov_core::StreamCursor,
     queued: VecDeque<StreamFrame>,
@@ -277,10 +353,11 @@ async fn replay_page(
     read_pool: crate::read_pool::ReadPool,
     after: kascov_core::StreamCursor,
     through: kascov_core::StreamCursor,
+    page_size: u64,
 ) -> kascov_core::Result<Vec<kascov_core::DeliveryRecord>> {
     tokio::task::spawn_blocking(move || {
         read_pool.query(|store| {
-            let mut page = store.delivery_page(Some(after), REPLAY_PAGE_SIZE)?;
+            let mut page = store.delivery_page(Some(after), page_size)?;
             page.retain(|record| record.cursor.seq <= through.seq);
             Ok(page)
         })
@@ -309,6 +386,7 @@ async fn next_stream_frame(
                     state.read_pool.clone(),
                     replay.cursor,
                     replay.through,
+                    state.replay_page_size,
                 )
                 .await
                 {
@@ -366,7 +444,7 @@ async fn next_stream_frame(
                         }
                         state.live_checkpoint = Some(record.cursor);
                         state.live_checkpoint_count = state.live_checkpoint_count.saturating_add(1);
-                        if state.live_checkpoint_count >= REPLAY_PAGE_SIZE as u16 {
+                        if state.live_checkpoint_count >= state.replay_page_size as u16 {
                             state.live_checkpoint_count = 0;
                             return Some((
                                 StreamFrame::Checkpoint(state.live_checkpoint.take().unwrap()),
@@ -399,29 +477,51 @@ async fn next_stream_frame(
     }
 }
 
-fn stream_frame_event(frame: StreamFrame) -> Option<axum::response::sse::Event> {
+fn stream_frame_event(
+    frame: StreamFrame,
+) -> std::result::Result<Option<axum::response::sse::Event>, &'static str> {
     use axum::response::sse::Event;
 
     match frame {
-        StreamFrame::Delivery(record) => Event::default()
-            .id(record.cursor.to_string())
-            .event(match record.kind {
-                kascov_core::DeliveryKind::Accepted => "accepted",
-                kascov_core::DeliveryKind::Removed => "removed",
-                kascov_core::DeliveryKind::ProjectionRepaired => "projection_repaired",
-            })
-            .json_data(&*record)
-            .ok(),
-        StreamFrame::Checkpoint(cursor) => Event::default()
+        StreamFrame::Delivery(record) => {
+            let bytes = serde_json::to_vec(&*record).map_err(|_| "delivery JSON encoding failed")?;
+            if bytes.len() > MAX_STREAM_EVENT_BYTES {
+                return Err("delivery exceeds the stream event byte limit");
+            }
+            Ok(Event::default()
+                .id(record.cursor.to_string())
+                .event(match record.kind {
+                    kascov_core::DeliveryKind::Accepted => "accepted",
+                    kascov_core::DeliveryKind::Removed => "removed",
+                    kascov_core::DeliveryKind::ProjectionRepaired => "projection_repaired",
+                })
+                .json_data(&*record)
+                .ok())
+        }
+        StreamFrame::Checkpoint(cursor) => Ok(Event::default()
             .id(cursor.to_string())
             .event("checkpoint")
             .json_data(serde_json::json!({
                 "kind": "checkpoint",
                 "cursor": cursor,
             }))
-            .ok(),
-        StreamFrame::Pending(message) => Some(pending_sse_event(&message)),
+            .ok()),
+        StreamFrame::Pending(message) => Ok(pending_sse_event(&message)),
     }
+}
+
+fn capacity_response(
+    status: axum::http::StatusCode,
+    message: &'static str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    (
+        status,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        message,
+    )
+        .into_response()
 }
 
 /// Replay durable delivery records, then hand off without gaps to the
@@ -435,7 +535,11 @@ pub(super) async fn stream_handler(
     use axum::http::StatusCode;
     use axum::response::sse::{Event, KeepAlive, Sse};
     use axum::response::IntoResponse;
-    use std::sync::atomic::Ordering;
+
+    if stream_request_bytes(&params, &headers) > MAX_STREAM_REQUEST_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "stream request exceeds 4096 bytes")
+            .into_response();
+    }
 
     let network = match resolve_network(&state, &net_name) {
         Ok(n) => n,
@@ -457,16 +561,12 @@ pub(super) async fn stream_handler(
         .find(|(candidate, _)| *candidate == network)
         .map(|(_, metrics)| metrics.clone())
         .expect("every configured network has performance metrics");
-    // Reserve a subscriber slot; back out over the cap.
-    if delivery_hub.subscribers.fetch_add(1, Ordering::AcqRel) >= MAX_STREAM_SUBSCRIBERS {
-        delivery_hub.subscribers.fetch_sub(1, Ordering::AcqRel);
-        return (
+    let Some(slot) = delivery_hub.try_subscribe() else {
+        return capacity_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "stream full — use the polling feeds",
-        )
-            .into_response();
-    }
-    let slot = SubscriberSlot(delivery_hub.subscribers.clone());
+            "stream capacity exhausted; retry or use the polling feeds",
+        );
+    };
     // Subscribe before reading high-water. Every commit after the snapshot is
     // then either in the replay range or queued here for the live handoff.
     let delivery_rx = delivery_hub.tx.subscribe();
@@ -528,11 +628,22 @@ pub(super) async fn stream_handler(
     }
     let StreamStart::Ready(after) = start else { unreachable!() };
 
-    let replay = (after.seq < info.current.seq).then_some(ReplayState {
-        cursor: after,
-        through: info.current,
-        last_emitted: after,
-    });
+    let replay = if after.seq < info.current.seq {
+        let Some(permit) = delivery_hub.try_replay() else {
+            return capacity_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "historical replay capacity exhausted; retry",
+            );
+        };
+        Some(ReplayState {
+            cursor: after,
+            through: info.current,
+            last_emitted: after,
+            _permit: permit,
+        })
+    } else {
+        None
+    };
     let stream_state = DurableStreamState {
         delivery_rx,
         pending_rx,
@@ -541,6 +652,7 @@ pub(super) async fn stream_handler(
         performance,
         read_pool,
         network,
+        replay_page_size: state.capacity.replay_page_size,
         replay,
         discard_through: info.current,
         queued: VecDeque::new(),
@@ -562,8 +674,15 @@ pub(super) async fn stream_handler(
                     .timer(kascov_core::performance::Stage::StreamDelivery);
                 stream_frame_event(frame)
             };
-            if let Some(event) = event {
-                return Some((Ok::<_, std::convert::Infallible>(event), state));
+            match event {
+                Ok(Some(event)) => {
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    tracing::warn!("{}: closing stream: {message}", state.network);
+                    return None;
+                }
             }
         }
     });
@@ -596,6 +715,82 @@ pub(super) async fn stream_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_limits() -> CapacityLimits {
+        CapacityLimits {
+            max_streams: DEFAULT_MAX_STREAMS,
+            max_replays: DEFAULT_MAX_REPLAYS,
+            replay_page_size: DEFAULT_REPLAY_PAGE_SIZE,
+            event_page_size: DEFAULT_EVENT_PAGE_SIZE,
+        }
+    }
+
+    #[test]
+    fn capacity_limits_reject_zero_and_oversized_replay_pages() {
+        assert!(test_limits().validate().is_ok());
+        assert!(CapacityLimits { max_streams: 0, ..test_limits() }
+            .validate()
+            .is_err());
+        assert!(CapacityLimits { max_replays: 0, ..test_limits() }
+            .validate()
+            .is_err());
+        assert!(CapacityLimits { replay_page_size: u64::from(u16::MAX) + 1, ..test_limits() }
+            .validate()
+            .is_err());
+        assert!(CapacityLimits { event_page_size: 0, ..test_limits() }
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn subscriber_slots_are_bounded_and_released() {
+        let hub = DeliveryHub::new(CapacityLimits {
+            max_streams: 1,
+            ..test_limits()
+        });
+        let slot = hub.try_subscribe().unwrap();
+        assert!(hub.try_subscribe().is_none());
+        drop(slot);
+        assert!(hub.try_subscribe().is_some());
+    }
+
+    #[test]
+    fn capacity_health_and_overload_response_expose_contract() {
+        let limits = test_limits();
+        let hub = DeliveryHub::new(limits);
+        let capacity = hub.capacity_json(limits);
+        assert_eq!(Some(512), capacity["max_streams"].as_u64());
+        assert_eq!(Some(32), capacity["max_historical_replays"].as_u64());
+        assert_eq!(Some(512), capacity["replay_page_records"].as_u64());
+        assert_eq!(Some(1_000), capacity["event_page_records"].as_u64());
+
+        let response = capacity_response(axum::http::StatusCode::TOO_MANY_REQUESTS, "busy");
+        assert_eq!(axum::http::StatusCode::TOO_MANY_REQUESTS, response.status());
+        assert_eq!("1", response.headers()[axum::http::header::RETRY_AFTER]);
+    }
+
+    #[test]
+    fn historical_replays_are_bounded_and_released() {
+        let hub = DeliveryHub::new(CapacityLimits {
+            max_replays: 1,
+            ..test_limits()
+        });
+        let permit = hub.try_replay().unwrap();
+        assert!(hub.try_replay().is_none());
+        drop(permit);
+        assert!(hub.try_replay().is_some());
+    }
+
+    #[test]
+    fn stream_request_and_event_bytes_are_bounded() {
+        let mut params = std::collections::HashMap::new();
+        let headers = axum::http::HeaderMap::new();
+        assert!(stream_request_bytes(&params, &headers) < MAX_STREAM_REQUEST_BYTES);
+        params.insert("actor".into(), "x".repeat(MAX_STREAM_REQUEST_BYTES));
+        assert!(stream_request_bytes(&params, &headers) > MAX_STREAM_REQUEST_BYTES);
+        assert!(pending_sse_event(&"x".repeat(MAX_STREAM_EVENT_BYTES)).is_some());
+        assert!(pending_sse_event(&"x".repeat(MAX_STREAM_EVENT_BYTES + 1)).is_none());
+    }
 
     #[test]
     fn delivery_filters_parse_and_reject() {
@@ -663,7 +858,9 @@ mod tests {
     async fn pending_frames_never_emit_an_eventsource_id() {
         use axum::response::IntoResponse;
         let stream = futures::stream::once(async {
-            Ok::<_, std::convert::Infallible>(pending_sse_event(r#"{"kind":"pending"}"#))
+            Ok::<_, std::convert::Infallible>(
+                pending_sse_event(r#"{"kind":"pending"}"#).unwrap(),
+            )
         });
         let response = axum::response::sse::Sse::new(stream).into_response();
         let bytes = axum::body::to_bytes(response.into_body(), 1_024)
@@ -714,10 +911,14 @@ mod tests {
             ),
             read_pool: crate::read_pool::ReadPool::new(&path, Network::Testnet(10)),
             network: Network::Testnet(10),
+            replay_page_size: DEFAULT_REPLAY_PAGE_SIZE,
             replay: Some(ReplayState {
                 cursor: after,
                 through,
                 last_emitted: after,
+                _permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
             }),
             discard_through: through,
             queued: VecDeque::new(),

@@ -17,14 +17,14 @@ fees.kascov.io {
 }
 
 kascov.io {
-	encode zstd gzip
+	@not_stream not path /data/*/stream
+	encode @not_stream zstd gzip
 
 	# Local, privacy-conscious access analytics. IP fields are hashed before
 	# disk; high-cardinality query values are not retained. Caddy also redacts
 	# Cookie/Authorization headers by default.
 	log {
 		output file C:/caddy/logs/kascov-access.json {
-			roll_at 00:00
 			roll_size 50MiB
 			roll_keep 35
 			roll_keep_for 720h
@@ -66,6 +66,7 @@ kascov.io {
 	handle @stream {
 		reverse_proxy 127.0.0.1:8080 {
 			flush_interval -1
+			header_up Last-Event-ID {http.request.header.Last-Event-ID}
 		}
 	}
 	@worker path /data/* /share/* /og/* /badge/* /img/* /listed-img/* /openapi.json /sitemap.xml /feed.xml /health /healthz
