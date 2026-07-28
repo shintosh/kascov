@@ -2,6 +2,29 @@ use std::time::Instant;
 
 use kascov_core::performance::{PerformanceMetrics, Stage};
 
+#[derive(Debug, Default)]
+pub struct ReadPoolMetrics {
+    checkout: kascov_core::performance::LatencyHistogram,
+    query: kascov_core::performance::LatencyHistogram,
+}
+
+impl ReadPoolMetrics {
+    pub fn record_checkout(&self, duration: std::time::Duration) {
+        self.checkout.record(duration);
+    }
+
+    pub fn record_query(&self, duration: std::time::Duration) {
+        self.query.record(duration);
+    }
+
+    pub fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "checkout": self.checkout.snapshot(),
+            "query": self.query.snapshot(),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileTrigger {
     Initial,

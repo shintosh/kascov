@@ -5,6 +5,7 @@ mod api;mod follower;
 mod og;
 mod pending;
 mod performance;
+mod read_pool;
 mod preflight;
 mod registry;
 mod stream;
@@ -1583,6 +1584,8 @@ fn trim_process_heap() {}
 struct ServeState {
     base_dir: std::path::PathBuf,
     networks: Vec<Network>,
+    /// One bounded, read-only SQLite pool per followed network.
+    read_pools: Vec<(Network, read_pool::ReadPool)>,
     max_events: u64,
     /// Node url for the custodial deploy endpoint (None → public resolver).
     rpc: Option<String>,
@@ -1789,10 +1792,40 @@ async fn shell_handler(uri: axum::http::Uri) -> axum::response::Response {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        body,
+        body,    )
+        .into_response()
+}
+
+fn read_pool_for(state: &ServeState, network: Network) -> read_pool::ReadPool {
+    state
+        .read_pools
+        .iter()
+        .find(|(candidate, _)| *candidate == network)
+        .map(|(_, pool)| pool.clone())
+        .expect("every configured network has a read pool")
+}
+
+fn read_unavailable(message: &'static str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        message,
+
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod read_unavailable_tests {
+    #[test]
+    fn response_has_a_retry_hint() {
+        let response = super::read_unavailable("busy");
+        assert_eq!(axum::http::StatusCode::SERVICE_UNAVAILABLE, response.status());
+        assert_eq!("1", response.headers()[axum::http::header::RETRY_AFTER]);
+    }
+}
+
 
 fn performance_for_key(
     state: &ServeState,
@@ -1845,6 +1878,7 @@ async fn serve(
     let mut sync_health = Vec::with_capacity(networks.len());
     let mut pending = Vec::with_capacity(networks.len());
     let mut network_performance = Vec::with_capacity(networks.len());
+    let mut read_pools = Vec::with_capacity(networks.len());
     for &network in &networks {
         let delivery_hub = DeliveryHub::new();
         let pending_hub = PendingHub::new();
@@ -1859,6 +1893,7 @@ async fn serve(
             delivery_high_water: std::sync::atomic::AtomicU64::new(0),
         });
         let db = base_dir.join(format!("{network}.db"));
+        read_pools.push((network, read_pool::ReadPool::new(&db, network)));
         // The pending poller opens its OWN read-only handle on the same file,
         // so hand it a separate path (the follower moves `db` below).
         let db_for_poller = db.clone();
@@ -1906,6 +1941,7 @@ async fn serve(
     let state = std::sync::Arc::new(ServeState {
         base_dir,
         networks,
+        read_pools,
         max_events,
         rpc: cli.rpc.clone(),
         deploy_limiter: tokio::sync::Mutex::new(DeployLimiter::new()),
@@ -2227,17 +2263,17 @@ async fn healthz_handler(
             })
             .unwrap_or((0, 0, 0, 0, 0, 0));
         let db = state.base_dir.join(format!("{network}.db"));
+        let read_pool = read_pool_for(&state, network);
         // Nulls until the follower has created the DB; an open/read failure
         // degrades to the same nulls rather than failing the whole probe.
         let indexed = if db.exists() {
-            tokio::task::spawn_blocking(move || -> Result<(Option<u64>, Option<u64>, bool)> {
-                let store = kascov_core::store::Store::open_read_only(&db, network)?;
+            tokio::task::spawn_blocking(move || read_pool.query(|store| {
                 Ok((
                     store.processed_daa()?,
                     store.tip()?.map(|t| t.0),
                     store.tx_index_backfill_done()?,
                 ))
-            })
+            }))
             .await
             .ok()
             .and_then(|r| r.ok())
@@ -2246,12 +2282,13 @@ async fn healthz_handler(
         };
         let (processed, tip, backfill_done) = indexed.unwrap_or((None, None, false));
         let lag = tip.zip(processed).map(|(t, p)| t.saturating_sub(p));
-        let performance = state
+        let mut performance = state
             .performance
             .iter()
             .find(|(candidate, _)| *candidate == network)
             .map(|(_, metrics)| performance::snapshot_json(metrics))
             .expect("every configured network has performance metrics");
+        performance["read_pool"] = read_pool_for(&state, network).metrics().snapshot_json();
         let network_stalled = now.saturating_sub(last_ok) > HEALTHZ_STALL_MS
             || (lag.is_some_and(|l| l > kascov_core::sync::WEDGE_LAG_DAA)
                 && now.saturating_sub(last_progress) > HEALTHZ_STALL_MS);
@@ -2482,7 +2519,7 @@ async fn webhook_delivery_forever(
         if stale {
             let db = db.clone();
             let any = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let store = Store::open_read_only(&db, network)?;
+                let store = Store::open_reader(&db, network)?;
                 Ok(store.subscription_count()? > 0)
             })
             .await;
@@ -2495,7 +2532,7 @@ async fn webhook_delivery_forever(
             let db = db.clone();
             let delivery = ev.delivery.clone();
             tokio::task::spawn_blocking(move || -> Result<(String, Vec<(i64, String, Option<String>)>)> {
-                let store = Store::open_read_only(&db, network)?;
+                let store = Store::open_reader(&db, network)?;
                 let kind = store
                     .events_by_txid(&delivery.txid)?
                     .into_iter()
@@ -3033,7 +3070,7 @@ struct OursSnapshot {
 }
 
 fn read_ours(db: &std::path::Path, network: Network) -> Result<OursSnapshot> {
-    let store = kascov_core::store::Store::open(db, network)?;
+    let store = kascov_core::store::Store::open_reader(db, network)?;
     let tip_daa = store.tip()?.map(|t| t.0);
     let mut views = std::collections::BTreeMap::new();
     for t in store.token_directory()? {
@@ -3055,7 +3092,7 @@ fn read_our_top_balances(
     network: Network,
     ids: &[String],
 ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>>> {
-    let store = kascov_core::store::Store::open(db, network)?;
+    let store = kascov_core::store::Store::open_reader(db, network)?;
     let mut out = std::collections::BTreeMap::new();
     for id in ids {
         let Ok(token_id) = id.parse::<kascov_core::CovenantId>() else {
@@ -3886,8 +3923,8 @@ async fn registry_handler(
     };
 
     let list_name = registry::list_name(&body);
-    let db = state.base_dir.join(format!("{network}.db"));
-    let db2 = db.clone();
+    let read_pool = read_pool_for(&state, network);
+    let db2 = state.base_dir.join(format!("{network}.db"));
     let built = tokio::task::spawn_blocking(move || -> Result<String> {
         let store = kascov_core::store::Store::open(&db, network)?;
         prove_listed_vesting_schedules(&store, &entries)?;
@@ -3960,6 +3997,7 @@ async fn registry_handler(
             "tokens": tokens_json,
         })
         .to_string())
+        })?)
     })
     .await;
 
@@ -4261,7 +4299,7 @@ async fn data_handler(
         Err(resp) => return resp,
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let (ttl, cache_control) = if live {
         // s-maxage lets the hosting CDN absorb the polling herd; SWR keeps
         // pages responsive while the edge revalidates.
@@ -4506,7 +4544,7 @@ async fn events_handler(
         Ok(request) => request,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     match tokio::task::spawn_blocking(move || {
         let store = kascov_core::store::Store::open_read_only(&db, network)?;
         events_page_json(&store, network, &request)
@@ -4515,15 +4553,19 @@ async fn events_handler(
     .await
     {
         Ok(Ok(value)) => uncached_json(value),
-        Ok(Err(EventsPageError::ForeignEpoch(info))) => {
+        Ok(Err(read_pool::ReadQueryError::Query(EventsPageError::ForeignEpoch(info)))) => {
             cursor_reset_response(network, "foreign_epoch", info)
         }
-        Ok(Err(EventsPageError::Ahead(info))) => {
+        Ok(Err(read_pool::ReadQueryError::Query(EventsPageError::Ahead(info)))) => {
             cursor_reset_response(network, "ahead", info)
         }
-        Ok(Err(EventsPageError::Store(error))) => {
+        Ok(Err(read_pool::ReadQueryError::Query(EventsPageError::Store(error)))) => {
             tracing::error!("{network}: durable event page failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "events unavailable").into_response()
+            read_unavailable("events unavailable")
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("{network}: durable event read pool unavailable: {error:?}");
+            read_unavailable("events unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: durable event page task failed: {error}");
@@ -4545,17 +4587,16 @@ async fn stream_info_handler(
         Ok(network) => network,
         Err(response) => return response,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     match tokio::task::spawn_blocking(move || {
-        let store = Store::open_read_only(&db, network)?;
-        stream_info_json(&store, network)
+        read_pool.query(|store| stream_info_json(store, network))
     })
     .await
     {
         Ok(Ok(value)) => uncached_json(value),
         Ok(Err(error)) => {
             tracing::error!("{network}: stream info failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "stream info unavailable").into_response()
+            read_unavailable("stream info unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: stream info task failed: {error}");
@@ -4835,9 +4876,8 @@ async fn application_rows_response(
         },
         None => None,
     };
-    let database = state.base_dir.join(format!("{network}.db"));
-    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
-        let store = Store::open_read_only(&database, network)?;
+    let read_pool = read_pool_for(&state, network);
+    match tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let mut rows = store.application_outputs_page(
             &application,
             actor.as_deref(),
@@ -4856,14 +4896,14 @@ async fn application_rows_response(
             "next_after_id": next_after_id,
         });
         data[data_key] = serde_json::to_value(rows)?;
-        application_response_json(&store, network, &application, data)
-    })
+        application_response_json(store, network, &application, data)
+    }))
     .await
     {
         Ok(Ok(value)) => uncached_json(value),
         Ok(Err(error)) => {
             tracing::error!("{network}: application query failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "application data unavailable").into_response()
+            read_unavailable("application data unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: application query task failed: {error}");
@@ -4943,9 +4983,8 @@ async fn application_failures_handler(
         Ok(page) => page,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let database = state.base_dir.join(format!("{network}.db"));
-    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
-        let store = Store::open_read_only(&database, network)?;
+    let read_pool = read_pool_for(&state, network);
+    match tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let mut failures = store.application_decode_failures_page(
             Some(&application),
             after_id,
@@ -4957,7 +4996,7 @@ async fn application_failures_handler(
         }
         let next_after_id = failures.last().map_or(after_id, |failure| failure.id);
         application_response_json(
-            &store,
+            store,
             network,
             &application,
             serde_json::json!({
@@ -4966,13 +5005,13 @@ async fn application_failures_handler(
                 "next_after_id": next_after_id,
             }),
         )
-    })
+    }))
     .await
     {
         Ok(Ok(value)) => uncached_json(value),
         Ok(Err(error)) => {
             tracing::error!("{network}: application failure query failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "application failures unavailable").into_response()
+            read_unavailable("application failures unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: application failure task failed: {error}");
@@ -5002,17 +5041,16 @@ async fn application_pending_handler(
         .lock()
         .await
         .application_snapshot_json_at(&application, now_ms());
-    let database = state.base_dir.join(format!("{network}.db"));
-    match tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
-        let store = Store::open_read_only(&database, network)?;
-        application_response_json(&store, network, &application, pending)
+    let read_pool = read_pool_for(&state, network);
+    match tokio::task::spawn_blocking(move || {
+        read_pool.query(|store| application_response_json(store, network, &application, pending))
     })
     .await
     {
         Ok(Ok(value)) => uncached_json(value),
         Ok(Err(error)) => {
             tracing::error!("{network}: pending application query failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "pending application data unavailable").into_response()
+            read_unavailable("pending application data unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: pending application task failed: {error}");
@@ -5039,27 +5077,26 @@ async fn application_transaction_handler(
         Ok(txid) => txid,
         Err(_) => return (StatusCode::BAD_REQUEST, "txid must be 64 hex characters").into_response(),
     };
-    let database = state.base_dir.join(format!("{network}.db"));
-    match tokio::task::spawn_blocking(move || -> Result<Option<serde_json::Value>> {
-        let store = Store::open_read_only(&database, network)?;
+    let read_pool = read_pool_for(&state, network);
+    match tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let Some(transaction) = store.application_transaction(&application, &txid)? else {
             return Ok(None);
         };
         application_response_json(
-            &store,
+            store,
             network,
             &application,
             serde_json::to_value(transaction)?,
         )
         .map(Some)
-    })
+    }))
     .await
     {
         Ok(Ok(Some(value))) => uncached_json(value),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, "application transaction not found").into_response(),
         Ok(Err(error)) => {
             tracing::error!("{network}: application transaction query failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "application transaction unavailable").into_response()
+            read_unavailable("application transaction unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: application transaction task failed: {error}");
@@ -5090,27 +5127,26 @@ async fn application_outpoint_handler(
         Ok(index) => index,
         Err(_) => return (StatusCode::BAD_REQUEST, "output index must be a non-negative integer").into_response(),
     };
-    let database = state.base_dir.join(format!("{network}.db"));
-    match tokio::task::spawn_blocking(move || -> Result<Option<serde_json::Value>> {
-        let store = Store::open_read_only(&database, network)?;
+    let read_pool = read_pool_for(&state, network);
+    match tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let Some(output) = store.application_output_by_outpoint(&application, &txid, index)? else {
             return Ok(None);
         };
         application_response_json(
-            &store,
+            store,
             network,
             &application,
             serde_json::to_value(output)?,
         )
         .map(Some)
-    })
+    }))
     .await
     {
         Ok(Ok(Some(value))) => uncached_json(value),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, "application outpoint not found").into_response(),
         Ok(Err(error)) => {
             tracing::error!("{network}: application outpoint query failed: {error}");
-            (StatusCode::SERVICE_UNAVAILABLE, "application outpoint unavailable").into_response()
+            read_unavailable("application outpoint unavailable")
         }
         Err(error) => {
             tracing::error!("{network}: application outpoint task failed: {error}");
@@ -5166,9 +5202,8 @@ async fn coins_handler(
         Ok(ids) => ids,
         Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
     };
-    let db = state.base_dir.join(format!("{network}.db"));
-    let built = tokio::task::spawn_blocking(move || -> Result<String> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+    let read_pool = read_pool_for(&state, network);
+    let built = tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let mut coins = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(s) = store.summary(&kascov_core::CovenantId(id))? {
@@ -5188,7 +5223,7 @@ async fn coins_handler(
             "generated_at_ms": now_ms(),
             "coins": coins,
         }))?)
-    })
+    }))
     .await;
     match built {
         Ok(Ok(json)) => (
@@ -5202,7 +5237,7 @@ async fn coins_handler(
             .into_response(),
         Ok(Err(err)) => {
             tracing::error!("{network}: coins batch failed: {err}");
-            (StatusCode::SERVICE_UNAVAILABLE, "snapshot unavailable").into_response()
+            read_unavailable("snapshot unavailable")
         }
         Err(err) => {
             tracing::error!("{network}: coins batch task panicked: {err}");
@@ -5813,7 +5848,7 @@ async fn token_handler(
     );
     let cc = "public, max-age=15, s-maxage=30, stale-while-revalidate=120";
     serve_cached(&state, key, 30, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let Some(t) = store.token_row(&token_id)? else {
             return Ok(None); // uncached 404
         };
@@ -5926,6 +5961,7 @@ async fn token_handler(
             out["next_after_seq"] = serde_json::json!(seq);
         }
         Ok(Some(serde_json::to_string(&out)?))
+        })?)
     })
     .await
 }
@@ -7538,7 +7574,7 @@ async fn verified_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let hash = hash.trim_end_matches(".json").to_lowercase();
     let got = tokio::task::spawn_blocking(
         move || -> anyhow::Result<Option<(String, String, Option<String>, u64)>> {
@@ -7699,11 +7735,11 @@ async fn lane_handler(
     }
     // 36_000 DAA ≈ 1 hour at 10 blocks/s — hour buckets over the lane's life.
     const LANE_BUCKET_DAA: u64 = 36_000;
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/lane/{ns}");
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let (events, covenants) = store.lane_stats(&ns)?;
         let recent: Vec<_> = store
             .lane_recent(&ns, 50)?
@@ -7732,6 +7768,7 @@ async fn lane_handler(
             "activity": activity,
             "bucket_daa": LANE_BUCKET_DAA,
         }))?))
+        })?)
     })
     .await
 }
@@ -7757,12 +7794,12 @@ async fn debug_handler(
     let Ok(txid) = tx_hex.parse::<TxId>() else {
         return (StatusCode::BAD_REQUEST, "bad txid").into_response();
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/debug/{txid}");
     // The result is immutable once the spend is indexed — cache hard.
     let cc = "public, max-age=300, s-maxage=3600, stale-while-revalidate=3600";
     serve_cached(&state, key, 3600, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let spent = store.spent_by_txid(&txid)?;
         // Prefer an input whose witness was captured (P2SH reveals).
         let Some(row) = spent
@@ -7804,6 +7841,7 @@ async fn debug_handler(
             "trace_truncated": truncated,
             "note": result.note,
         }))?))
+        })?)
     })
     .await
 }
@@ -7890,7 +7928,7 @@ async fn lifespans_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let cc = "public, max-age=120, s-maxage=300, stale-while-revalidate=900";
     serve_cached(
         &state,
@@ -7927,10 +7965,10 @@ async fn inscriptions_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let cc = "public, max-age=60, s-maxage=180, stale-while-revalidate=600";
     serve_cached(&state, format!("{network}/inscriptions"), 90, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let items: Vec<_> = store
             .inscription_breakdown()?
             .into_iter()
@@ -7941,6 +7979,7 @@ async fn inscriptions_handler(
             "generated_at_ms": now_ms(),
             "inscriptions": items,
         }))?))
+        })?)
     })
     .await
 }
@@ -7954,7 +7993,7 @@ async fn lanes_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let cc = "public, max-age=30, s-maxage=120, stale-while-revalidate=600";
     serve_cached(
         &state,
@@ -8046,7 +8085,7 @@ async fn families_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let cc = "public, max-age=30, s-maxage=120, stale-while-revalidate=600";
     serve_cached(
         &state,
@@ -8075,7 +8114,7 @@ async fn reorgs_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let cc = "public, max-age=30, s-maxage=120, stale-while-revalidate=600";
     serve_cached(
         &state,
@@ -8118,7 +8157,7 @@ async fn galaxy_handler(
         core_only: q.get("tier").is_some_and(|v| v == "core"),
         visual_only: columnar && q.get("tier").is_some_and(|v| v == "visual"),
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let cc = "public, max-age=30, s-maxage=120, stale-while-revalidate=600";
     // fold the (parsed, hence bounded: 4 combos) variant into the cache key;
     // the bare request keeps its historical key.
@@ -8139,8 +8178,7 @@ async fn galaxy_handler(
     // two variants every ~240s — so requests always land inside the fresh
     // window instead of paying a cold rebuild at the door.
     serve_cached(&state, key, 300, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        Ok(Some(build_galaxy_json(&store, network, fmt)?))
+        Ok(read_pool.query(|store| Ok(Some(build_galaxy_json(store, network, fmt)?)))?)
     })
     .await
 }
@@ -8162,19 +8200,20 @@ async fn detail_handler(
         return (StatusCode::BAD_REQUEST, "bad covenant id").into_response();
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let max_events = state.max_events;
     let key = format!("{network}/c/{covenant_id}");
     let cc = "public, max-age=10, s-maxage=30, stale-while-revalidate=120";
     serve_cached(&state, key, 10, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let registry = kascov_decode::Registry::default();
         match store.summary(&covenant_id)? {
             Some(summary) => Ok(Some(serde_json::to_string(&build_covenant_detail(
-                &store, &registry, network, &summary, max_events,
+                store, &registry, network, &summary, max_events,
             )?)?)),
             None => Ok(None),
         }
+        })?)
     })
     .await
 }
@@ -8555,18 +8594,17 @@ async fn token_image_handler(
     };
 
     let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     // 1. cache + claim lookup (blocking store work off the runtime workers)
-    let db2 = db.clone();
-    let lookup = tokio::task::spawn_blocking(move || -> Result<_> {
-        let store = kascov_core::store::Store::open(&db2, network)?;
+    let lookup = tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let cached = store.token_image(&covenant_id)?;
         let claim = store.claimed_token_meta(&covenant_id)?;
         Ok((cached, claim))
-    })
+    }))
     .await;
     let (cached, claim) = match lookup {
         Ok(Ok(v)) => v,
-        _ => return (StatusCode::SERVICE_UNAVAILABLE, "store unavailable").into_response(),
+        _ => return read_unavailable("store unavailable"),
     };
 
     let serve = |ct: String, bytes: Vec<u8>| {
@@ -8722,9 +8760,8 @@ async fn badge_handler(
     };
 
     let _ = &headers;
-    let db = state.base_dir.join(format!("{network}.db"));
-    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+    let read_pool = read_pool_for(&state, network);
+    let result = tokio::task::spawn_blocking(move || read_pool.query(|store| {
         let Some(summary) = store.summary(&covenant_id)? else { return Ok(None) };
         let name = og::friendly_name(&summary.covenant_id.to_string());
         let alive = summary.live_utxos > 0;
@@ -8756,7 +8793,7 @@ async fn badge_handler(
             mx = lw + mw / 2,
         );
         Ok(Some(svg))
-    })
+    }))
     .await;
     match result {
         Ok(Ok(Some(svg))) => (
@@ -8770,7 +8807,7 @@ async fn badge_handler(
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, "unknown covenant").into_response(),
         Ok(Err(err)) => {
             tracing::error!("{network}: badge failed: {err}");
-            (StatusCode::SERVICE_UNAVAILABLE, "badge unavailable").into_response()
+            read_unavailable("badge unavailable")
         }
         Err(err) => {
             tracing::error!("{network}: badge panicked: {err}");
@@ -8828,7 +8865,7 @@ async fn og_card_handler(
             started.elapsed().as_millis()
         );
         Ok(Some(png))
-    })
+    }))
     .await;
     match result {
         Ok(Ok(Some(png))) => (
@@ -8845,7 +8882,7 @@ async fn og_card_handler(
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, "unknown covenant").into_response(),
         Ok(Err(err)) => {
             tracing::error!("{network}: og card failed: {err}");
-            (StatusCode::SERVICE_UNAVAILABLE, "card unavailable").into_response()
+            read_unavailable("card unavailable")
         }
         Err(err) => {
             tracing::error!("{network}: og card panicked: {err}");
@@ -9059,7 +9096,7 @@ async fn share_handler(
             &app,
             &body_extra,
         )))
-    })
+    }))
     .await;
     match result {
         Ok(Ok(Some(html))) => (
@@ -9075,7 +9112,7 @@ async fn share_handler(
         }
         Ok(Err(err)) => {
             tracing::error!("{network}: share page failed: {err}");
-            (StatusCode::SERVICE_UNAVAILABLE, "share page unavailable").into_response()
+            read_unavailable("share page unavailable")
         }
         Err(err) => {
             tracing::error!("{network}: share page panicked: {err}");
@@ -9136,8 +9173,11 @@ async fn sitemap_handler(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    let include_mainnet = state.networks.contains(&Network::Mainnet);
-    let db = state.base_dir.join("mainnet.db");
+    let mainnet_pool = state
+        .read_pools
+        .iter()
+        .find(|(network, _)| *network == Network::Mainnet)
+        .map(|(_, pool)| pool.clone());
     let resp = serve_cached(
         &state,
         "sitemap".to_string(),
@@ -9145,10 +9185,12 @@ async fn sitemap_handler(
         "public, max-age=600, s-maxage=3600",
         accepts_gzip(&headers),
         move || {
-            let store = include_mainnet
-                .then(|| kascov_core::store::Store::open(&db, Network::Mainnet))
-                .transpose()?;
-            Ok(Some(build_sitemap_xml(store.as_ref(), now_ms())?))
+            match mainnet_pool {
+                Some(pool) => Ok(pool.query(|store| {
+                    Ok(Some(build_sitemap_xml(Some(store), now_ms())?))
+                })?),
+                None => Ok(Some(build_sitemap_xml(None, now_ms())?)),
+            }
         },
     )
     .await;
@@ -9310,11 +9352,11 @@ async fn kcc1_template_handler(
         return (StatusCode::BAD_REQUEST, "bad template hash").into_response();
     }
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/template/{hash_hex}");
     let cc = "public, max-age=60, s-maxage=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let covenants = store.covenants_by_kcc1_hash(&hash_bytes)?;
         if covenants.is_empty() {
             return Ok(None);
@@ -9326,6 +9368,7 @@ async fn kcc1_template_handler(
             "count": ids.len(),
             "covenants": ids,
         }))?))
+        })?)
     })
     .await
 }
@@ -9349,11 +9392,11 @@ async fn tx_handler(
         return (StatusCode::BAD_REQUEST, "bad txid").into_response();
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/tx/{txid}");
     let cc = "public, max-age=60, s-maxage=300";
     let resp = serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let events = store.events_by_txid(&txid)?;
         if events.is_empty() {
             return Ok(None); // uncached 404, rewritten to the canonical body below
@@ -9486,6 +9529,7 @@ async fn tx_handler(
             });
         }
         Ok(Some(serde_json::to_string(&out)?))
+        })?)
     })
     .await;
     // serve_cached's generic 404 → this endpoint's canonical body (existing
@@ -9516,7 +9560,7 @@ async fn digest_handler(
         Err(resp) => return resp,
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/digest");
     let cc = "public, max-age=60, s-maxage=300, stale-while-revalidate=600";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
@@ -9541,7 +9585,7 @@ async fn templates_handler(
         Err(resp) => return resp,
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/templates");
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
@@ -9585,7 +9629,7 @@ async fn activity_handler(
         }
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!("{network}/activity/{range}");
     let cc = "public, max-age=15, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 30, cc, accepts_gzip(&headers), move || {
@@ -10180,12 +10224,12 @@ async fn addr_handler(
             .into_response();
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     // pubkey hex normalizes the cache key: address form and hex form share one entry
     let key = format!("{network}/addr/{}", hex::encode(&pubkey));
     let cc = "public, max-age=10, s-maxage=30, stale-while-revalidate=120";
     serve_cached(&state, key, 20, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let rows = store.covenants_by_pubkey(&pubkey)?;
         let total = rows.len();
         let tip = store.tip()?;
@@ -10277,6 +10321,7 @@ async fn addr_handler(
             "token_holdings": holdings,
             "trades": trades,
         }))?))
+        })?)
     })
     .await
 }
@@ -10563,9 +10608,8 @@ async fn search_handler(
     let listed_body = registry_list_cached().await;
     let db = state.base_dir.join(format!("{network}.db"));
     let state2 = state.clone();
-    let built = tokio::task::spawn_blocking(move || -> Result<String> {
+    let built = tokio::task::spawn_blocking(move || read_pool.query(|store| {
         use kascov_core::store::CovenantSummary;
-        let store = kascov_core::store::Store::open(&db, network)?;
         let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let push = |s: &CovenantSummary, matched: &str, rows: &mut Vec<serde_json::Value>| {
@@ -10584,7 +10628,7 @@ async fn search_handler(
         }
         // (b) friendly-name prefix, (c) template substring — via the index.
         if rows.len() < limit {
-            let idx = search_index_for(&state2, network, &store)?;
+            let idx = search_index_for(&state2, network, store)?;
             for id in name_prefix_matches(&idx.names, &q, limit - rows.len()) {
                 if !seen.contains(&id) {
                     if let Some(s) = store.summary(&kascov_core::CovenantId(id))? {
@@ -10658,7 +10702,7 @@ async fn search_handler(
             "results": rows,
         });
         Ok(serde_json::to_string(&out)?)
-    })
+    }))
     .await;
 
     match built {
@@ -10675,7 +10719,7 @@ async fn search_handler(
             .into_response(),
         Ok(Err(err)) => {
             tracing::error!("{network}: search failed: {err}");
-            (StatusCode::SERVICE_UNAVAILABLE, "search unavailable").into_response()
+            read_unavailable("search unavailable")
         }
         Err(err) => {
             tracing::error!("{network}: search task panicked: {err}");

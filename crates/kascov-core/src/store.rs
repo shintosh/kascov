@@ -1528,10 +1528,12 @@ impl Store {
         Ok(store)
     }
 
-    pub fn open_read_only(path: &Path, network: Network) -> Result<Self> {
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(db_err)?;
+    pub fn open_reader(path: &Path, network: Network) -> Result<Self> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).map_err(db_err)?;
         conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(db_err)?;
+        conn.pragma_update(None, "query_only", true).map_err(db_err)?;
         let existing: String = conn
             .query_row("SELECT value FROM meta WHERE key = 'network'", [], |row| row.get(0))
             .map_err(db_err)?;
@@ -1542,6 +1544,22 @@ impl Store {
             )));
         }
         Ok(Self { conn, _writer_lease: None })
+    }
+
+    pub fn reader_is_healthy(&self) -> Result<()> {
+        let query_only: bool = self
+            .conn
+            .pragma_query_value(None, "query_only", |row| row.get(0))
+            .map_err(db_err)?;
+        if !query_only {
+            return Err(Error::Invalid {
+                what: "reader connection",
+                value: "query_only is disabled".to_owned(),
+            });
+        }
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key = 'network'", [], |_| Ok(()))
+            .map_err(db_err)
     }
 
     /// On a classifier-version bump, clear the stamps the old classifier

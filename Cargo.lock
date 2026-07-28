@@ -2268,6 +2268,7 @@ dependencies = [
  "kaspa-addresses 2.0.1 (git+https://github.com/kaspanet/rusty-kaspa?rev=98a4ccd8d200853787f227bd4536ac540cf34957)",
  "kaspa-consensus-core 2.0.1 (git+https://github.com/kaspanet/rusty-kaspa?rev=98a4ccd8d200853787f227bd4536ac540cf34957)",
  "kaspa-wrpc-client",
+ "r2d2",
  "reqwest",
  "resvg",
  "roxmltree",
@@ -2276,6 +2277,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tower-http",
  "tracing",
@@ -3819,6 +3821,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r2d2"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51de85fb3fb6524929c8a2eb85e6b6d363de4e8c48f9e2c2eac4944abc181c93"
+dependencies = [
+ "log",
+ "parking_lot",
+ "scheduled-thread-pool",
+]
+
+[[package]]
 name = "rand"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4307,6 +4320,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f7caad094bd561859bcd467734a720c3c1f5d1f338995351fefe2190c45efed"
 dependencies = [
  "bytemuck",
+]
+
+[[package]]
+name = "scheduled-thread-pool"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cbc66816425a074528352f5789333ecff06ca41b36b0b0efdfbb29edc391a19"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]

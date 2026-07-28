@@ -986,7 +986,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let writer = Store::open(&path, Network::Testnet(10)).unwrap();
         assert!(Store::open(&path, Network::Testnet(10)).is_err());
-        let reader = Store::open_read_only(&path, Network::Testnet(10)).unwrap();
+        let reader = Store::open_reader(&path, Network::Testnet(10)).unwrap();
+        reader.reader_is_healthy().unwrap();
+        assert!(reader.delete_subscription(1).is_err());
         assert_eq!(writer.stream_epoch().unwrap(), reader.stream_epoch().unwrap());
         drop(reader);
         drop(writer);

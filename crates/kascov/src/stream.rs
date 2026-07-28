@@ -262,7 +262,7 @@ struct DurableStreamState {
     _slot: SubscriberSlot,
     filter: kascov_core::store_delivery::DeliveryFilter,
     performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
-    database: std::path::PathBuf,
+    read_pool: crate::read_pool::ReadPool,
     network: Network,
     replay: Option<ReplayState>,
     discard_through: kascov_core::StreamCursor,
@@ -274,22 +274,26 @@ struct DurableStreamState {
 }
 
 async fn replay_page(
-    database: std::path::PathBuf,
-    network: Network,
+    read_pool: crate::read_pool::ReadPool,
     after: kascov_core::StreamCursor,
     through: kascov_core::StreamCursor,
 ) -> kascov_core::Result<Vec<kascov_core::DeliveryRecord>> {
     tokio::task::spawn_blocking(move || {
-        let store = Store::open_read_only(&database, network)?;
-        let mut page = store.delivery_page(Some(after), REPLAY_PAGE_SIZE)?;
-        page.retain(|record| record.cursor.seq <= through.seq);
-        Ok(page)
+        read_pool.query(|store| {
+            let mut page = store.delivery_page(Some(after), REPLAY_PAGE_SIZE)?;
+            page.retain(|record| record.cursor.seq <= through.seq);
+            Ok(page)
+        })
     })
     .await
     .map_err(|error| kascov_core::Error::Invalid {
         what: "delivery replay task",
         value: error.to_string(),
     })?
+    .map_err(|error| kascov_core::Error::Invalid {
+        what: "delivery replay read pool",
+        value: error.to_string(),
+    })
 }
 
 async fn next_stream_frame(
@@ -302,8 +306,7 @@ async fn next_stream_frame(
         if let Some(replay) = state.replay.as_mut() {
             if replay.cursor.seq < replay.through.seq {
                 let page = match replay_page(
-                    state.database.clone(),
-                    state.network,
+                    state.read_pool.clone(),
                     replay.cursor,
                     replay.through,
                 )
@@ -468,17 +471,17 @@ pub(super) async fn stream_handler(
     // then either in the replay range or queued here for the live handoff.
     let delivery_rx = delivery_hub.tx.subscribe();
     let pending_rx = pending_hub.tx.subscribe();
-    let database = state.base_dir.join(format!("{network}.db"));
-    let db = database.clone();
+    let read_pool = super::read_pool_for(&state, network);
+    let info_pool = read_pool.clone();
     let info = match tokio::task::spawn_blocking(move || {
-        kascov_core::store::Store::open_read_only(&db, network)?.delivery_stream_info()
+        info_pool.query(|store| Ok(store.delivery_stream_info()?))
     })
     .await
     {
         Ok(Ok(info)) => info,
         Ok(Err(error)) => {
             tracing::error!("{network}: stream cursor discovery failed: {error}");
-            return (StatusCode::SERVICE_UNAVAILABLE, "stream unavailable").into_response();
+            return super::read_unavailable("stream unavailable");
         }
         Err(error) => {
             tracing::error!("{network}: stream cursor task failed: {error}");
@@ -536,7 +539,7 @@ pub(super) async fn stream_handler(
         _slot: slot,
         filter,
         performance,
-        database,
+        read_pool,
         network,
         replay,
         discard_through: info.current,
@@ -709,7 +712,7 @@ mod tests {
             performance: std::sync::Arc::new(
                 kascov_core::performance::PerformanceMetrics::new(),
             ),
-            database: path,
+            read_pool: crate::read_pool::ReadPool::new(&path, Network::Testnet(10)),
             network: Network::Testnet(10),
             replay: Some(ReplayState {
                 cursor: after,
