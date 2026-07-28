@@ -5,20 +5,8 @@
      const k = new Kascov('testnet-10');
      const { covenants, next_after_daa } = await k.coins({ limit: 100 });
      const coin = await k.coin(covenants[0].covenant_id);
-     for await (const ev of k.stream()) console.log(ev.kind, ev.covenant_id);
-     for await (const ev of k.stream({ covenant: id })) ...  // one coin only
+     const stream = k.stream({ onMessage: (ev) => console.log(ev.kind) });
 
-   The API needs no token. An optional lane token (minted at kascov.io/lane)
-   rides along as an X-Kascov-Lane header on every request; it buys extra
-   capacity on the holder lane and nothing else — the anonymous tier keeps
-   working without it:
-
-     const k = new Kascov('mainnet', 'https://kascov.io', { laneToken: '...' });
-
-   Passport badges verify locally — no request, no trust in the server:
-
-     import { verifyBadge } from './kascov.mjs';
-     verifyBadge(claim, proof, root);  // true only if the claim is in the tree
 
    Publishing to npm is a separate decision — this file is the whole client. */
 
@@ -102,6 +90,16 @@ export class Kascov {
     return this.#get(`/data/${this.network}/events${suffix ? `?${suffix}` : ''}`);
   }
 
+  /** Current accepted application state, with cursor and freshness metadata. */
+  applicationState(application, opts = {}) {
+    const q = new URLSearchParams();
+    for (const [key, value] of Object.entries(opts)) {
+      if (value != null) q.set(key, value);
+    }
+    const suffix = q.toString();
+    return this.#get(`/data/${this.network}/apps/${encodeURIComponent(application)}/state${suffix ? `?${suffix}` : ''}`);
+  }
+
   /** Contract-type analytics (what's running on this network). */
   templates() { return this.#get(`/data/${this.network}/templates.json`); }
 
@@ -179,40 +177,37 @@ export class Kascov {
   /** Births/moves/burns per DAA bucket. range: 1h|6h|24h|48h|all */
   activity(range = '24h') { return this.#get(`/data/${this.network}/activity.json?range=${range}`); }
 
-  /** The SSE URL the worker actually serves: /data/{network}/stream, with an
-      optional ?covenant=<64 hex> filter narrowing it to one coin. Extracted so
-      tests pin the shape against the route registered in main.rs. */
-  streamUrl(covenant) {
-    const q = covenant ? `?covenant=${encodeURIComponent(covenant)}` : '';
-    return `${this.base}/data/${this.network}/stream${q}`;
-  }
+  /** Open a native EventSource. The browser sends Last-Event-ID on automatic
+      reconnect. A reset closes the source so the caller can load a snapshot
+      before opening a new stream. */
+  stream(opts = {}) {
+    const EventSourceClass = opts.EventSource || globalThis.EventSource;
+    if (!EventSourceClass) throw new Error('kascov: EventSource is unavailable');
+    const q = new URLSearchParams();
+    for (const key of ['after', 'covenant', 'application', 'artifact', 'actor']) {
+      if (opts[key] != null) q.set(key, opts[key]);
 
-  /** Live events as an async iterator (SSE). Yields {covenant_id, kind,
-      txid, accepting_daa}. Hints only — refetch details on receipt.
-      opts.covenant: exactly 64 hex chars follows ONE coin; anything else is
-      a 400 from the server, never a silent firehose. */
-  async *stream({ covenant, signal } = {}) {
-    const res = await fetch(this.streamUrl(covenant), {
-      headers: this.#headers('text/event-stream'),
-      signal,
-    });
-    if (!res.ok || !res.body) throw new Error(`kascov: stream → HTTP ${res.status}`);
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf('\n\n')) >= 0) {
-        const chunk = buf.slice(0, i);
-        buf = buf.slice(i + 2);
-        const data = chunk.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('');
-        if (!data) continue;
-        try { yield JSON.parse(data); } catch { /* keepalive/comment */ }
-      }
     }
+    const suffix = q.toString();
+    const source = new EventSourceClass(
+      `${this.base}/data/${this.network}/stream${suffix ? `?${suffix}` : ''}`,
+    );
+    source.onopen = (event) => opts.onOpen?.(event);
+    source.onerror = (event) => opts.onError?.(event);
+    const deliver = (event) => {
+      try { opts.onMessage?.(JSON.parse(event.data), event); } catch { /* invalid data is ignored */ }
+    };
+    source.onmessage = deliver;
+    for (const kind of ['accepted', 'removed', 'projection_repaired', 'checkpoint']) {
+      source.addEventListener(kind, deliver);
+    }
+    source.addEventListener('reset', (event) => {
+      let reset = null;
+      try { reset = JSON.parse(event.data); } catch { /* malformed reset stays null */ }
+      source.close();
+      opts.onReset?.(reset, event);
+    });
+    return source;
   }
 }
 

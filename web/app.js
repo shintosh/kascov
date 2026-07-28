@@ -7388,15 +7388,9 @@ setInterval(pollLive, LIVE_MS);
    schedules an immediate pollLive() (debounced, so bursts fold into one),
    and any error backs off and leaves polling untouched. Some CDNs buffer
    rewrites — if the stream never delivers, nothing is lost. */
-const STREAM_RETRY_BASE_MS = 5_000;
-const STREAM_RETRY_MAX_MS = 60_000;
-/* a connection must live this long (or deliver a message) before the retry
-   backoff resets — a proxy that accepts and instantly drops would otherwise
-   reset it on every open and pin the reconnect loop at the base interval */
-const STREAM_SETTLE_MS = 5_000;
 const STREAM_POKE_MS = 500;
 
-const stream = { es: null, network: null, retryMs: STREAM_RETRY_BASE_MS, retryTimer: 0, pokeTimer: 0, settleTimer: 0 };
+const stream = { es: null, network: null, connecting: null, generation: 0, pokeTimer: 0, retryTimer: 0 };
 
 function streamWanted() {
   const view = parseRoute().view;
@@ -7404,14 +7398,14 @@ function streamWanted() {
 }
 
 function closeStream() {
+  stream.generation += 1;
   if (stream.es) { stream.es.close(); stream.es = null; }
   stream.network = null;
-  clearTimeout(stream.retryTimer);
+  stream.connecting = null;
   clearTimeout(stream.pokeTimer);
-  clearTimeout(stream.settleTimer);
-  stream.retryTimer = 0;
+  clearTimeout(stream.retryTimer);
   stream.pokeTimer = 0;
-  stream.settleTimer = 0;
+  stream.retryTimer = 0;
 }
 
 function flashLiveBadge() {
@@ -7430,9 +7424,17 @@ const STREAM_ORIGIN = /(^|\.)kascov-explorer\.web\.app$|\.firebaseapp\.com$/.tes
   ? 'https://kascov.io/'
   : '';
 
-/* Open/close/retarget the stream to match the current view + network.
-   Idempotent — called from render() and visibilitychange. */
-function syncStream() {
+async function currentStreamCursor(network) {
+  const response = await fetch(`${STREAM_ORIGIN}data/${network}/stream-info.json`, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`stream info HTTP ${response.status}`);
+  const info = await response.json();
+  if (typeof info.current !== 'string') throw new Error('stream info has no current cursor');
+  return info.current;
+}
+
+/* Open after the current snapshot. Native EventSource owns reconnects and
+   sends Last-Event-ID. The initial ?after remains subordinate to that header. */
+async function syncStream() {
   if (typeof EventSource === 'undefined') {
     setPendingConnection(state.network, 'offline');
     return;
@@ -7442,31 +7444,41 @@ function syncStream() {
     closeStream();
     return;
   }
-  if (stream.es && stream.network === state.network) return;
+  if ((stream.es && stream.network === state.network) || stream.connecting === state.network) return;
   closeStream();
   const network = state.network;
+  const generation = stream.generation;
+  stream.connecting = network;
   setPendingConnection(network, 'connecting');
+  let after;
+  try {
+    after = await currentStreamCursor(network);
+  } catch (_) {
+    if (generation === stream.generation) {
+      stream.connecting = null;
+      setPendingConnection(network, 'retrying');
+      stream.retryTimer = setTimeout(syncStream, 5_000);
+    }
+    return;
+  }
+  if (generation !== stream.generation || network !== state.network || !streamWanted()) return;
   let es;
   try {
-    es = new EventSource(`${STREAM_ORIGIN}data/${network}/stream`);
+    es = new EventSource(`${STREAM_ORIGIN}data/${network}/stream?after=${encodeURIComponent(after)}`);
   } catch (_) {
+    stream.connecting = null;
     setPendingConnection(network, 'retrying');
-    stream.retryTimer = setTimeout(syncStream, stream.retryMs);
-    stream.retryMs = Math.min(stream.retryMs * 2, STREAM_RETRY_MAX_MS);
+    stream.retryTimer = setTimeout(syncStream, 5_000);
     return;
   }
   stream.es = es;
   stream.network = network;
+  stream.connecting = null;
   es.onopen = () => {
     setPendingConnection(network, 'live');
     reconcilePending(network, true);
-    clearTimeout(stream.settleTimer);
-    stream.settleTimer = setTimeout(() => {
-      if (stream.es === es) stream.retryMs = STREAM_RETRY_BASE_MS;
-    }, STREAM_SETTLE_MS);
   };
-  es.onmessage = (e) => {
-    stream.retryMs = STREAM_RETRY_BASE_MS;
+  const handleStreamMessage = (e) => {
     setPendingConnection(network, 'live');
     /* pending (mempool) frames drive their own section and must not poke the
        confirmed feed; parse defensively so a keepalive can never throw. */
@@ -7484,12 +7496,23 @@ function syncStream() {
     clearTimeout(stream.pokeTimer);
     stream.pokeTimer = setTimeout(pollLive, STREAM_POKE_MS);
   };
+  es.onmessage = handleStreamMessage;
+  ['accepted', 'removed', 'projection_repaired', 'checkpoint'].forEach((kind) => {
+    es.addEventListener(kind, handleStreamMessage);
+  });
+  es.addEventListener('reset', async () => {
+    if (stream.es !== es) return;
+    es.close();
+    stream.es = null;
+    setPendingConnection(network, 'connecting');
+    await Promise.all([pollLive(), refreshSnapshot(true), reconcilePending(network, true)]);
+    if (network === state.network && streamWanted()) syncStream();
+  });
   es.onerror = () => {
     if (stream.es !== es) return;
     setPendingConnection(network, 'retrying');
-    closeStream();
-    stream.retryTimer = setTimeout(syncStream, stream.retryMs);
-    stream.retryMs = Math.min(stream.retryMs * 2, STREAM_RETRY_MAX_MS);
+    /* Keep this EventSource open. The browser reconnects it with
+       Last-Event-ID and the server's retry interval. */
   };
 }
 
@@ -7498,20 +7521,20 @@ function syncStream() {
    workers ignore the param and fan out network-wide — every event is
    re-checked client-side by covenant_id before acting, so both are safe. */
 const DETAIL_REFETCH_DEBOUNCE_MS = 600;
-const detailStream = { es: null, key: null, retryMs: STREAM_RETRY_BASE_MS, retryTimer: 0, refetchTimer: 0, settleTimer: 0 };
+const detailStream = { es: null, key: null, connecting: null, generation: 0, refetchTimer: 0, retryTimer: 0 };
 
 function closeDetailStream() {
+  detailStream.generation += 1;
   if (detailStream.es) { detailStream.es.close(); detailStream.es = null; }
   detailStream.key = null;
-  clearTimeout(detailStream.retryTimer);
+  detailStream.connecting = null;
   clearTimeout(detailStream.refetchTimer);
-  clearTimeout(detailStream.settleTimer);
-  detailStream.retryTimer = 0;
+  clearTimeout(detailStream.retryTimer);
   detailStream.refetchTimer = 0;
-  detailStream.settleTimer = 0;
+  detailStream.retryTimer = 0;
 }
 
-function syncDetailStream() {
+async function syncDetailStream() {
   if (typeof EventSource === 'undefined') return;
   const route = parseRoute();
   const want = document.visibilityState === 'visible' && route.view === 'detail' &&
@@ -7520,19 +7543,35 @@ function syncDetailStream() {
   const network = state.network;
   const covId = route.id;
   const key = `${network}|${covId}`;
-  if (detailStream.es && detailStream.key === key) return;
+  if ((detailStream.es && detailStream.key === key) || detailStream.connecting === key) return;
   closeDetailStream();
-  const es = new EventSource(`${STREAM_ORIGIN}data/${network}/stream?covenant=${covId}`);
+  const generation = detailStream.generation;
+  detailStream.connecting = key;
+  let after;
+  try {
+    after = await currentStreamCursor(network);
+  } catch (_) {
+    if (generation === detailStream.generation) {
+      detailStream.connecting = null;
+      detailStream.retryTimer = setTimeout(syncDetailStream, 5_000);
+    }
+    return;
+  }
+  if (generation !== detailStream.generation || key !== `${state.network}|${parseRoute().id}`) return;
+  let es;
+  try {
+    es = new EventSource(
+      `${STREAM_ORIGIN}data/${network}/stream?after=${encodeURIComponent(after)}&covenant=${covId}`,
+    );
+  } catch (_) {
+    detailStream.connecting = null;
+    detailStream.retryTimer = setTimeout(syncDetailStream, 5_000);
+    return;
+  }
   detailStream.es = es;
   detailStream.key = key;
-  es.onopen = () => {
-    clearTimeout(detailStream.settleTimer);
-    detailStream.settleTimer = setTimeout(() => {
-      if (detailStream.es === es) detailStream.retryMs = STREAM_RETRY_BASE_MS;
-    }, STREAM_SETTLE_MS);
-  };
-  es.onmessage = (ev) => {
-    detailStream.retryMs = STREAM_RETRY_BASE_MS;
+  detailStream.connecting = null;
+  const handleDetailMessage = (ev) => {
     let msg = null;
     try { msg = JSON.parse(ev.data); } catch (err) { return; }
     if (!msg || msg.covenant_id !== covId) return;
@@ -7546,11 +7585,19 @@ function syncDetailStream() {
     clearTimeout(detailStream.refetchTimer);
     detailStream.refetchTimer = setTimeout(() => refetchDetail(network, covId), DETAIL_REFETCH_DEBOUNCE_MS);
   };
-  es.onerror = () => {
+  es.onmessage = handleDetailMessage;
+  ['accepted', 'removed', 'projection_repaired', 'checkpoint'].forEach((kind) => {
+    es.addEventListener(kind, handleDetailMessage);
+  });
+  es.addEventListener('reset', async () => {
     if (detailStream.es !== es) return;
-    closeDetailStream();
-    detailStream.retryTimer = setTimeout(syncDetailStream, detailStream.retryMs);
-    detailStream.retryMs = Math.min(detailStream.retryMs * 2, STREAM_RETRY_MAX_MS);
+    es.close();
+    detailStream.es = null;
+    await refetchDetail(network, covId);
+    if (key === `${state.network}|${parseRoute().id}`) syncDetailStream();
+  });
+  es.onerror = () => {
+    /* Native EventSource reconnects with Last-Event-ID. */
   };
 }
 
@@ -7559,7 +7606,7 @@ function syncDetailStream() {
 function refetchDetail(network, covId) {
   const map = state.details[network];
   if (map) map.delete(covId);
-  loadDetail(network, covId)
+  return loadDetail(network, covId)
     .then(() => {
       const route = parseRoute();
       if (state.network !== network || route.view !== 'detail' || route.id !== covId) return;

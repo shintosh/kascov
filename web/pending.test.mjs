@@ -205,6 +205,26 @@ test('connection state is explicit instead of implying that a retrying stream is
   assert.equal(model.view().connection, 'retrying');
 });
 
+test('EventSource resumes natively and reloads a snapshot after reset', () => {
+  const liveStream = app.slice(app.indexOf('async function currentStreamCursor('), app.indexOf('/* Per-coin stream:'));
+  assert.match(liveStream, /stream-info\.json/);
+  assert.match(liveStream, /new EventSource\(`\$\{STREAM_ORIGIN\}data\/\$\{network\}\/stream\?after=/);
+  assert.match(liveStream, /addEventListener\('reset'/);
+  assert.match(liveStream, /\['accepted', 'removed', 'projection_repaired', 'checkpoint'\]/);
+  assert.match(liveStream, /Promise\.all\(\[pollLive\(\), refreshSnapshot\(true\), reconcilePending/);
+  assert.match(liveStream, /Last-Event-ID/);
+  const errorBody = liveStream.slice(liveStream.indexOf('es.onerror ='), liveStream.indexOf('\n  };', liveStream.indexOf('es.onerror =')));
+  assert.doesNotMatch(errorBody, /closeStream|new EventSource|setTimeout/);
+});
+
+test('the filtered detail stream uses the same cursor and reset contract', () => {
+  const detail = app.slice(app.indexOf('async function syncDetailStream('), app.indexOf('function refetchDetail('));
+  assert.match(detail, /after=\$\{encodeURIComponent\(after\)\}&covenant=\$\{covId\}/);
+  assert.match(detail, /addEventListener\('reset'/);
+  assert.match(detail, /await refetchDetail\(network, covId\)/);
+  assert.match(detail, /Last-Event-ID/);
+});
+
 test('a dropped pending row clears after its shorter visible interval', () => {
   const clock = fakeClock();
   const model = createPendingModel({

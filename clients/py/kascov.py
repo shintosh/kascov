@@ -139,6 +139,13 @@ class Kascov:
         suffix = f"?{urllib.parse.urlencode(q)}" if q else ""
         return self._get(f"/data/{self.network}/events{suffix}")
 
+    def application_state(self, application: str, **filters: Any) -> Dict[str, Any]:
+        """Current accepted application state with cursor and freshness metadata."""
+        q = {key: value for key, value in filters.items() if value is not None}
+        suffix = f"?{urllib.parse.urlencode(q)}" if q else ""
+        application = urllib.parse.quote(application, safe="")
+        return self._get(f"/data/{self.network}/apps/{application}/state{suffix}")
+
     def templates(self) -> Dict[str, Any]:
         """Contract-type analytics (what's running on this network)."""
         return self._get(f"/data/{self.network}/templates.json")
@@ -227,31 +234,68 @@ class Kascov:
         """Births/moves/burns per DAA bucket. range: 1h|6h|24h|48h|all"""
         return self._get(f"/data/{self.network}/activity.json?range={range}")
 
-    def stream_url(self, covenant: Optional[str] = None) -> str:
-        """The SSE URL the worker actually serves: /data/{network}/stream, with
-        an optional ?covenant=<64 hex> filter narrowing it to one coin.
-        Extracted so tests pin the shape against the route in main.rs."""
-        q = f"?covenant={urllib.parse.quote(covenant)}" if covenant else ""
-        return f"{self.base}/data/{self.network}/stream{q}"
+    def stream(
+        self,
+        after: Optional[str] = None,
+        covenant: Optional[str] = None,
+        application: Optional[str] = None,
+        artifact: Optional[str] = None,
+        actor: Optional[str] = None,
+        reconnect: bool = True,
+    ) -> Iterator[Dict[str, Any]]:
+        """Durable SSE events. Reconnects with Last-Event-ID after the first response.
 
-    def stream(self, covenant: Optional[str] = None) -> Iterator[Dict[str, Any]]:
-        """Live events (SSE) as an iterator. Hints only — refetch on receipt.
-        covenant: exactly 64 hex chars follows ONE coin; anything else is a
-        400 from the server, never a silent firehose."""
-        req = urllib.request.Request(
-            self.stream_url(covenant),
-            headers=self._headers("text/event-stream"),
-        )
-        with urllib.request.urlopen(req, timeout=None) as res:
-            for raw in res:
-                line = raw.decode("utf-8", "replace").strip()
-                if line.startswith("data:"):
-                    payload = line[5:].strip()
-                    if payload:
-                        try:
-                            yield json.loads(payload)
-                        except json.JSONDecodeError:
-                            continue
+        Each result keeps the server payload and adds ``_event`` and ``_cursor``.
+        A ``reset`` result ends the iterator so the caller can reload a snapshot.
+        """
+        q = {
+            key: value
+            for key, value in {
+                "after": after,
+                "covenant": covenant,
+                "application": application,
+                "artifact": artifact,
+                "actor": actor,
+            }.items()
+            if value is not None
+        }
+        suffix = f"?{urllib.parse.urlencode(q)}" if q else ""
+        url = f"{self.base}/data/{self.network}/stream{suffix}"
+        cursor: Optional[str] = None
+        while True:
+            headers = {"accept": "text/event-stream", "user-agent": "kascov-py"}
+            if cursor is not None:
+                headers["Last-Event-ID"] = cursor
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=None) as res:
+                event_name = "message"
+                event_id: Optional[str] = None
+                data: list[str] = []
+                for raw in res:
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if line == "":
+                        if data:
+                            try:
+                                payload = json.loads("\n".join(data))
+                            except json.JSONDecodeError:
+                                payload = None
+                            if isinstance(payload, dict):
+                                if event_id is not None:
+                                    cursor = event_id
+                                payload["_event"] = event_name
+                                payload["_cursor"] = event_id
+                                yield payload
+                                if event_name == "reset":
+                                    return
+                        event_name, event_id, data = "message", None, []
+                    elif line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("id:"):
+                        event_id = line[3:].strip()
+                    elif line.startswith("data:"):
+                        data.append(line[5:].lstrip())
+            if not reconnect:
+                return
 
 
 # ---------------------------------------------------------------------------
