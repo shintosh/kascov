@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long, global = true)]
     db: Option<std::path::PathBuf>,
 
+    /// Operator-owned Argent application manifest JSON.
+    #[arg(long, global = true)]
+    argent_manifest: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -310,6 +314,35 @@ it has never been spent, or the index has not walked the spend yet"
             Ok(())
         }
     }
+}
+
+fn application_decoder(
+    cli: &Cli,
+) -> Result<std::sync::Arc<dyn kascov_core::ApplicationDecoder>> {
+    let path = cli.argent_manifest.clone().or_else(|| {
+        std::env::var_os("KASCOV_ARGENT_MANIFEST").map(std::path::PathBuf::from)
+    });
+    let Some(path) = path else {
+        return Ok(std::sync::Arc::new(kascov_core::NoApplicationDecoder));
+    };
+    let manifest = kascov_argent::ApprovedManifest::load(&path)
+        .with_context(|| format!("failed to load Argent manifest {}", path.display()))?;
+    for rejection in manifest.rejections() {
+        tracing::warn!(
+            "Argent application {} rejected: {} ({})",
+            rejection.application_id,
+            rejection.code,
+            rejection.detail
+        );
+    }
+    tracing::info!(
+        "loaded {} approved Argent applications from {}",
+        manifest.applications().len(),
+        path.display()
+    );
+    Ok(std::sync::Arc::new(kascov_argent::ArgentDecoder::new(
+        manifest,
+    )))
 }
 
 fn export(cli: &Cli, out: Option<std::path::PathBuf>, max_events: u64) -> Result<()> {
@@ -1035,6 +1068,7 @@ async fn inspect_tx(cli: &Cli, txid: TxId) -> Result<()> {
 
 async fn sync(cli: &Cli, from: Option<BlockHash>, follow: bool, watch: bool) -> Result<()> {
     let mut store = open_store(cli)?;
+    let decoder = application_decoder(cli)?;
     loop {
         let node = match NodeHandle::connect(cli.network, cli.rpc.as_deref()).await {
             Ok(node) => node,
@@ -1045,7 +1079,17 @@ async fn sync(cli: &Cli, from: Option<BlockHash>, follow: bool, watch: bool) -> 
             }
             Err(err) => return Err(err).context("failed to connect to node"),
         };
-        match sync_session(cli, &node, &mut store, from, follow, watch).await {
+        match sync_session(
+            cli,
+            &node,
+            &mut store,
+            decoder.as_ref(),
+            from,
+            follow,
+            watch,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) if follow => {
                 eprintln!("sync interrupted ({err}), reconnecting in 5s…");
@@ -1063,6 +1107,7 @@ async fn sync_session(
     cli: &Cli,
     node: &NodeHandle,
     store: &mut kascov_core::store::Store,
+    decoder: &(impl kascov_core::ApplicationDecoder + ?Sized),
     from: Option<BlockHash>,
     follow: bool,
     watch: bool,
@@ -1070,44 +1115,54 @@ async fn sync_session(
     use kascov_core::sync::SyncUpdate;
     let json = cli.json;
     loop {
-        let stats = kascov_core::sync::sync_once(node, store, from, |update| match update {
-            SyncUpdate::Progress(s) if !watch => {
-                eprintln!(
-                    "… {} chain blocks, {} covenant events",
-                    s.chain_blocks, s.events
-                );
-            }
-            SyncUpdate::Progress(_) => {}
-            SyncUpdate::Reorg { rolled_back } => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"type": "reorg", "rolled_back": rolled_back})
-                    );
-                } else {
-                    println!("REORG      rolled back {rolled_back} chain blocks");
+        let stats = kascov_core::sync::sync_once_with_decoder(
+            node,
+            store,
+            from,
+            decoder,
+            |update| match update {
+                SyncUpdate::Progress(s) if !watch => {
+                    eprintln!("… {} chain blocks, {} covenant events", s.chain_blocks, s.events);
+
                 }
-            }
-            SyncUpdate::Committed(batch) => {
-                for record in batch.deliveries {
+                SyncUpdate::Progress(_) => {}
+                SyncUpdate::Reorg { rolled_back } => {
                     if json {
-                        println!("{}", serde_json::json!({"type": "delivery", "delivery": record}));
+                        println!(
+                            "{}",
+                            serde_json::json!({"type": "reorg", "rolled_back": rolled_back})
+                        );
                     } else {
-                        println!("ACCEPTED   {}  tx {}  @ DAA {}  cursor {}", record.covenant_id, record.txid, record.accepting_daa, record.cursor);
+                        println!("REORG      rolled back {rolled_back} chain blocks");
                     }
 
                 }
-            }
-            SyncUpdate::Removed(batch) => {
-                for record in batch.deliveries {
-                    if json {
-                        println!("{}", serde_json::json!({"type": "delivery", "delivery": record}));
-                    } else {
-                        println!("REMOVED    {}  tx {}  @ DAA {}  cursor {}", record.covenant_id, record.txid, record.accepting_daa, record.cursor);
+                SyncUpdate::Committed(batch) => {
+                    for record in batch.deliveries {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"type": "delivery", "delivery": record})
+                            );
+                        } else {
+                            println!("ACCEPTED   {}  tx {}  @ DAA {}  cursor {}", record.covenant_id, record.txid, record.accepting_daa, record.cursor);
+                        }
                     }
                 }
-            }
-        })
+                SyncUpdate::Removed(batch) => {
+                    for record in batch.deliveries {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"type": "delivery", "delivery": record})
+                            );
+                        } else {
+                            println!("REMOVED    {}  tx {}  @ DAA {}  cursor {}", record.covenant_id, record.txid, record.accepting_daa, record.cursor);
+                        }
+                    }
+                }
+            },
+        )
         .await?;
         if !follow {
             eprintln!(
@@ -1750,11 +1805,11 @@ async fn serve(
     });
     std::fs::create_dir_all(&base_dir)?;
     // These databases are the sole archive of what this worker publishes.
-    // Probe them under the boot policy BEFORE any background task can create
-    // files at their paths: a missing mainnet.db must abort the process
-    // loudly, not let the follower start an empty archive and serve amnesia.
+    // Probe them before background tasks can create a fresh archive.
     let fresh = fresh_policy_from_env(std::env::var("KASCOV_FRESH_OK").ok().as_deref());
     probe_archives_at_boot(&base_dir, &networks, fresh)?;
+    let decoder = application_decoder(cli)?;
+
 
     let mut deliveries = Vec::with_capacity(networks.len());
     let mut pending_hubs = Vec::with_capacity(networks.len());
@@ -1764,6 +1819,7 @@ async fn serve(
     for &network in &networks {
         let delivery_hub = DeliveryHub::new();
         let pending_hub = PendingHub::new();
+        let pending_set = std::sync::Arc::new(tokio::sync::Mutex::new(PendingFeed::new()));
         let metrics = std::sync::Arc::new(kascov_core::performance::PerformanceMetrics::new());
         let health = std::sync::Arc::new(SyncHealth {
             last_node_notification_ms: std::sync::atomic::AtomicI64::new(0),
@@ -1790,19 +1846,22 @@ async fn serve(
             db,
             delivery_hub.tx.clone(),
             hook_tx,
+            pending_hub.tx.clone(),
+            pending_set.clone(),
+            decoder.clone(),
             health.clone(),
             metrics.clone(),
         ));
         // Live pending (mempool) covenant feed: an additive, isolated poller
         // that reads the same node the follower confirms against and keeps its
         // own Store connection (never the follower's &mut).
-        let pending_set = std::sync::Arc::new(tokio::sync::Mutex::new(PendingFeed::new()));
         tokio::spawn(poll_mempool_forever(
             network,
             cli.rpc.clone(),
             db_for_poller,
             pending_hub.tx.clone(),
             pending_set.clone(),
+            decoder.clone(),
         ));
         deliveries.push((network, delivery_hub));
         pending_hubs.push((network, pending_hub));

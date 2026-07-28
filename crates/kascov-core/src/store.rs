@@ -2181,7 +2181,11 @@ impl Store {
                 tx_index: Some(event.tx_index),
                 event_index: Some(event.event_index),
                 order_complete: true,
-                pending_id: None,
+                pending_id: Some(crate::pending_event_id(
+                    event.txid,
+                    event.covenant_id,
+                    event.event_index,
+                )),
                 applications,
             };
             crate::store_delivery::insert_delivery(&tx, &delivery)?;

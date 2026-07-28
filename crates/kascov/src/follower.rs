@@ -102,6 +102,9 @@ pub(super) async fn follow_forever(
     db: std::path::PathBuf,
     delivery_tx: tokio::sync::broadcast::Sender<std::sync::Arc<kascov_core::DeliveryRecord>>,
     hook_tx: tokio::sync::mpsc::Sender<HookEvent>,
+    pending_tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    pending: std::sync::Arc<tokio::sync::Mutex<crate::pending::PendingFeed>>,
+    decoder: std::sync::Arc<dyn kascov_core::ApplicationDecoder>,
     health: std::sync::Arc<SyncHealth>,
     performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
 ) {
@@ -218,7 +221,8 @@ pub(super) async fn follow_forever(
                 }
 
                 let publication = performance.clone();
-                let publish = |deliveries: Vec<kascov_core::DeliveryRecord>, webhook: bool| {
+                let mut accepted_txids = std::collections::HashSet::new();
+                let mut publish = |deliveries: Vec<kascov_core::DeliveryRecord>, webhook: bool| {
                     let _publication =
                         publication.timer(kascov_core::performance::Stage::Publication);
                     for record in deliveries {
@@ -235,15 +239,17 @@ pub(super) async fn follow_forever(
                             let _ = delivery_tx.send(record.clone());
                         }
                         if webhook {
+                            accepted_txids.insert(record.txid);
                             let _ = hook_tx.try_send(HookEvent { delivery: record });
                         }
                     }
                 };
-                let result = kascov_core::sync::sync_once_measured(
+                let result = kascov_core::sync::sync_once_measured_with_decoder(
                     &node,
                     &mut store,
                     None,
                     &performance,
+                    decoder.as_ref(),
                     |update| match update {
                         SyncUpdate::Committed(batch) => publish(batch.deliveries, true),
                         SyncUpdate::Removed(batch) => publish(batch.deliveries, false),
@@ -254,6 +260,14 @@ pub(super) async fn follow_forever(
                     },
                 )
                 .await;
+                if !accepted_txids.is_empty() {
+                    crate::pending::resolve_accepted_pending(
+                        &pending,
+                        &pending_tx,
+                        &accepted_txids,
+                    )
+                    .await;
+                }
                 match result {
                     Ok(_) => {
                         consecutive_errors = 0;

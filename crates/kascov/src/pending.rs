@@ -26,12 +26,15 @@ const PENDING_HEALTH_STALE_MS: u64 = 5_000;
 struct PendingEvent {
     covenant_id: CovenantId,
     kind: kascov_core::store::EventKind,
+    ordinal: u32,
 }
 
 /// One pending transaction we're tracking between "seen in mempool" and
 /// "resolved" (confirmed or dropped).
 struct PendingEntry {
     events: Vec<PendingEvent>,
+    inputs: Vec<kascov_core::Outpoint>,
+    application: kascov_core::ApplicationPreprocess,
     first_seen: std::time::Instant,
     first_seen_ms: u64,
     /// Set the first poll a tracked txid is gone from the pool; the drop-grace
@@ -139,7 +142,16 @@ impl PendingFeed {
         kind: kascov_core::store::EventKind,
         at_ms: u64,
     ) -> PendingInsert {
-        self.insert_at(txid, covenant_id, kind, at_ms, std::time::Instant::now())
+        self.insert_at(
+            txid,
+            covenant_id,
+            kind,
+            0,
+            at_ms,
+            std::time::Instant::now(),
+            vec![],
+            kascov_core::ApplicationPreprocess::default(),
+        )
     }
 
     fn insert_at(
@@ -147,8 +159,11 @@ impl PendingFeed {
         txid: TxId,
         covenant_id: CovenantId,
         kind: kascov_core::store::EventKind,
+        ordinal: u32,
         at_ms: u64,
         at: std::time::Instant,
+        inputs: Vec<kascov_core::Outpoint>,
+        application: kascov_core::ApplicationPreprocess,
     ) -> PendingInsert {
         if let Some(entry) = self.entries.get_mut(&txid) {
             if let Some(existing) = entry
@@ -161,7 +176,11 @@ impl PendingFeed {
                 }
                 existing.kind = kind;
             } else {
-                entry.events.push(PendingEvent { covenant_id, kind });
+                entry.events.push(PendingEvent {
+                    covenant_id,
+                    kind,
+                    ordinal,
+                });
             }
             entry.events.sort_by_key(|event| event.covenant_id.0);
             self.revision = self.revision.wrapping_add(1);
@@ -173,7 +192,13 @@ impl PendingFeed {
         self.entries.insert(
             txid,
             PendingEntry {
-                events: vec![PendingEvent { covenant_id, kind }],
+                events: vec![PendingEvent {
+                    covenant_id,
+                    kind,
+                    ordinal,
+                }],
+                inputs,
+                application,
                 first_seen: at,
                 first_seen_ms: at_ms,
                 leaving_since: None,
@@ -207,7 +232,8 @@ impl PendingFeed {
                     "tx_kind": primary.kind.as_str(),
                     "txid": txid,
                     "age_ms": generated_at_ms.saturating_sub(entry.first_seen_ms),
-                    "events": pending_events_json(entry),
+                    "events": pending_events_json(txid, entry),
+                    "application": pending_application_json(entry),
                 }))
             })
             .collect();
@@ -235,26 +261,50 @@ impl PendingFeed {
 /// whether an SSE hint will have an authoritative row that can later resolve.
 fn track_pending_transaction(
     feed: &mut PendingFeed,
-    txid: TxId,
+    tx: &kascov_core::Transaction,
     events: Vec<kascov_core::sync::PendingTxEvent>,
+    application: kascov_core::ApplicationPreprocess,
 ) -> PendingInsert {
-    track_pending_transaction_at(feed, txid, events, now_ms(), std::time::Instant::now())
+    track_pending_transaction_at(
+        feed,
+        tx,
+        events,
+        application,
+        now_ms(),
+        std::time::Instant::now(),
+    )
 }
 
 fn track_pending_transaction_at(
     feed: &mut PendingFeed,
-    txid: TxId,
+    tx: &kascov_core::Transaction,
     mut events: Vec<kascov_core::sync::PendingTxEvent>,
+    application: kascov_core::ApplicationPreprocess,
     at_ms: u64,
     at: std::time::Instant,
 ) -> PendingInsert {
-    if !feed.entries.contains_key(&txid) && feed.entries.len() >= MAX_PENDING {
+    if !feed.entries.contains_key(&tx.txid) && feed.entries.len() >= MAX_PENDING {
         return PendingInsert::Overflow;
     }
     events.sort_by_key(|event| event.covenant_id.0);
+    let inputs: Vec<_> = tx
+        .inputs
+        .iter()
+        .map(|input| input.previous_outpoint)
+        .collect();
     let mut result = PendingInsert::AlreadyTracked;
-    for event in events {
-        if feed.insert_at(txid, event.covenant_id, event.kind, at_ms, at) == PendingInsert::Added {
+    for (ordinal, event) in events.into_iter().enumerate() {
+        if feed.insert_at(
+            tx.txid,
+            event.covenant_id,
+            event.kind,
+            ordinal as u32,
+            at_ms,
+            at,
+            inputs.clone(),
+            application.clone(),
+        ) == PendingInsert::Added
+        {
             result = PendingInsert::Added;
         }
     }
@@ -268,7 +318,21 @@ fn track_pending_transaction_at_ms(
     events: Vec<kascov_core::sync::PendingTxEvent>,
     at_ms: u64,
 ) -> PendingInsert {
-    track_pending_transaction_at(feed, txid, events, at_ms, std::time::Instant::now())
+    let tx = kascov_core::Transaction {
+        txid,
+        version: 1,
+        inputs: vec![],
+        outputs: vec![],
+        payload: vec![],
+    };
+    track_pending_transaction_at(
+        feed,
+        &tx,
+        events,
+        kascov_core::ApplicationPreprocess::default(),
+        at_ms,
+        std::time::Instant::now(),
+    )
 }
 
 /// Only successfully classified/admitted txids enter the next poll's seen set.
@@ -279,7 +343,7 @@ fn pending_ids_to_remember(mut current: HashSet<TxId>, retry: &HashSet<TxId>) ->
     current
 }
 
-fn pending_events_json(entry: &PendingEntry) -> Vec<serde_json::Value> {
+fn pending_events_json(txid: &TxId, entry: &PendingEntry) -> Vec<serde_json::Value> {
     entry
         .events
         .iter()
@@ -287,9 +351,29 @@ fn pending_events_json(entry: &PendingEntry) -> Vec<serde_json::Value> {
             serde_json::json!({
                 "covenant_id": event.covenant_id,
                 "tx_kind": event.kind.as_str(),
+                "pending_id": kascov_core::pending_event_id(
+                    *txid,
+                    event.covenant_id,
+                    event.ordinal,
+                ),
             })
         })
         .collect()
+}
+
+fn pending_application_json(entry: &PendingEntry) -> serde_json::Value {
+    let status = if entry.application.raw_envelope.is_none() {
+        "absent"
+    } else if entry.application.failures.is_empty() {
+        "valid"
+    } else {
+        "invalid"
+    };
+    serde_json::json!({
+        "status": status,
+        "outputs": entry.application.outputs,
+        "failures": entry.application.failures,
+    })
 }
 
 /// Deterministic pending hints. Existing consumers still receive one message
@@ -300,7 +384,7 @@ fn pending_sse_jsons(feed: &PendingFeed, txid: &TxId) -> Vec<serde_json::Value> 
     let Some(entry) = feed.entries.get(txid) else {
         return vec![];
     };
-    let events = pending_events_json(entry);
+    let events = pending_events_json(txid, entry);
     entry
         .events
         .iter()
@@ -308,10 +392,16 @@ fn pending_sse_jsons(feed: &PendingFeed, txid: &TxId) -> Vec<serde_json::Value> 
         .map(|event| {
             serde_json::json!({
                 "kind": "pending",
+                "pending_id": kascov_core::pending_event_id(
+                    *txid,
+                    event.covenant_id,
+                    event.ordinal,
+                ),
                 "covenant_id": event.covenant_id,
                 "tx_kind": event.kind.as_str(),
                 "txid": txid,
                 "events": events.clone(),
+                "application": pending_application_json(entry),
                 "revision": feed.revision,
             })
         })
@@ -322,17 +412,63 @@ fn pending_resolved_sse_json(
     txid: &TxId,
     entry: &PendingEntry,
     resolution: &'static str,
+    replaced_by: Option<TxId>,
     revision: u64,
 ) -> Option<serde_json::Value> {
     let primary = entry.events.first()?;
-    Some(serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": "pending_resolved",
         "covenant_id": primary.covenant_id,
         "txid": txid,
         "resolution": resolution,
-        "events": pending_events_json(entry),
+        "events": pending_events_json(txid, entry),
+        "application": pending_application_json(entry),
         "revision": revision,
-    }))
+    });
+    if let Some(replaced_by) = replaced_by {
+        value["replaced_by"] = serde_json::json!(replaced_by);
+    }
+    Some(value)
+}
+
+fn replacement_for(
+    txid: TxId,
+    entry: &PendingEntry,
+    current_spenders: &std::collections::HashMap<kascov_core::Outpoint, TxId>,
+) -> Option<TxId> {
+    entry
+        .inputs
+        .iter()
+        .filter_map(|outpoint| current_spenders.get(outpoint))
+        .copied()
+        .find(|replacement| replacement != &txid)
+}
+
+pub(super) async fn resolve_accepted_pending(
+    pending: &std::sync::Arc<tokio::sync::Mutex<PendingFeed>>,
+    live_tx: &tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    accepted_txids: &HashSet<TxId>,
+) -> usize {
+    let mut resolved = Vec::new();
+    {
+        let mut feed = pending.lock().await;
+        for txid in accepted_txids {
+            if let Some(entry) = feed.remove(txid) {
+                resolved.push((*txid, entry, feed.revision));
+            }
+        }
+    }
+    let count = resolved.len();
+    if live_tx.receiver_count() > 0 {
+        for (txid, entry, revision) in resolved {
+            if let Some(message) =
+                pending_resolved_sse_json(&txid, &entry, "accepted", None, revision)
+            {
+                let _ = live_tx.send(message.to_string().into());
+            }
+        }
+    }
+    count
 }
 
 /// A node without mempool RPC answers get_mempool_entries as an unsupported
@@ -360,6 +496,7 @@ pub(super) async fn poll_mempool_forever(
     db: std::path::PathBuf,
     live_tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
     pending: std::sync::Arc<tokio::sync::Mutex<PendingFeed>>,
+    decoder: std::sync::Arc<dyn kascov_core::ApplicationDecoder>,
 ) {
     // Kill-switch: KASCOV_MEMPOOL=off disables the feed for every network.
     if std::env::var("KASCOV_MEMPOOL")
@@ -380,11 +517,10 @@ pub(super) async fn poll_mempool_forever(
         Ok(url) if !url.trim().is_empty() => Some(url),
         _ => rpc,
     };
-    // Kaspa runs ~10 blocks/sec, so a covenant tx sits in the mempool only a
-    // few hundred ms to ~2s before it confirms. A coarse poll steps right over
-    // them; verified live, 250ms catches the vast majority while keeping the
-    // full-mempool fetch to ~4/sec against the local node.
-    let poll = std::time::Duration::from_millis(env_ms("KASCOV_MEMPOOL_POLL_MS", 250));
+    // Keep the pending lane responsive without accepting unbounded operator
+    // input. The accepted follower remains independent of this poller.
+    let poll =
+        std::time::Duration::from_millis(env_ms("KASCOV_MEMPOOL_POLL_MS", 100).clamp(25, 1_000));
     let grace = std::time::Duration::from_millis(env_ms("KASCOV_MEMPOOL_DROP_GRACE_MS", 8000));
     let max_age = std::time::Duration::from_millis(env_ms("KASCOV_MEMPOOL_MAX_AGE_MS", 600_000));
 
@@ -430,6 +566,14 @@ pub(super) async fn poll_mempool_forever(
                 }
             };
             let cur_ids: HashSet<TxId> = txs.iter().map(|tx| tx.txid).collect();
+            let current_spenders: std::collections::HashMap<kascov_core::Outpoint, TxId> = txs
+                .iter()
+                .flat_map(|tx| {
+                    tx.inputs
+                        .iter()
+                        .map(move |input| (input.previous_outpoint, tx.txid))
+                })
+                .collect();
             let now = std::time::Instant::now();
             pending.lock().await.mark_live_at(now_ms());
             let mut retry_ids = HashSet::new();
@@ -454,9 +598,10 @@ pub(super) async fn poll_mempool_forever(
                 if events.is_empty() {
                     continue;
                 }
+                let application = decoder.preprocess(tx);
                 let (admission, messages) = {
                     let mut feed = pending.lock().await;
-                    let admission = track_pending_transaction(&mut feed, tx.txid, events);
+                    let admission = track_pending_transaction(&mut feed, tx, events, application);
                     let messages = if admission.tracked() {
                         pending_sse_jsons(&feed, &tx.txid)
                             .into_iter()
@@ -487,7 +632,7 @@ pub(super) async fn poll_mempool_forever(
 
             // Resolve tracked txids that LEFT the pool, and age out stale ones.
             // Collect broadcasts under the lock; send after releasing it.
-            let mut resolved: Vec<(TxId, PendingEntry, &'static str, u64)> = vec![];
+            let mut resolved: Vec<(TxId, PendingEntry, &'static str, Option<TxId>, u64)> = vec![];
             {
                 let mut set = pending.lock().await;
                 let tracked: Vec<TxId> = set.order.iter().copied().collect();
@@ -501,7 +646,7 @@ pub(super) async fn poll_mempool_forever(
                     // resolution we somehow missed) is dropped after max_age.
                     if now.duration_since(first_seen) >= max_age {
                         if let Some(entry) = set.remove(&txid) {
-                            resolved.push((txid, entry, "dropped", set.revision));
+                            resolved.push((txid, entry, "dropped", None, set.revision));
                         }
                         continue;
                     }
@@ -520,7 +665,23 @@ pub(super) async fn poll_mempool_forever(
                         .unwrap_or(false);
                     if confirmed {
                         if let Some(entry) = set.remove(&txid) {
-                            resolved.push((txid, entry, "confirmed", set.revision));
+                            resolved.push((txid, entry, "accepted", None, set.revision));
+                        }
+                        continue;
+                    }
+                    let replaced_by = set
+                        .entries
+                        .get(&txid)
+                        .and_then(|entry| replacement_for(txid, entry, &current_spenders));
+                    if let Some(replaced_by) = replaced_by {
+                        if let Some(entry) = set.remove(&txid) {
+                            resolved.push((
+                                txid,
+                                entry,
+                                "replaced",
+                                Some(replaced_by),
+                                set.revision,
+                            ));
                         }
                         continue;
                     }
@@ -537,15 +698,15 @@ pub(super) async fn poll_mempool_forever(
                     };
                     if now.duration_since(since) >= grace {
                         if let Some(entry) = set.remove(&txid) {
-                            resolved.push((txid, entry, "dropped", set.revision));
+                            resolved.push((txid, entry, "dropped", None, set.revision));
                         }
                     }
                 }
             }
-            for (txid, entry, resolution, revision) in resolved {
+            for (txid, entry, resolution, replaced_by, revision) in resolved {
                 if live_tx.receiver_count() > 0 {
                     if let Some(msg) =
-                        pending_resolved_sse_json(&txid, &entry, resolution, revision)
+                        pending_resolved_sse_json(&txid, &entry, resolution, replaced_by, revision)
                     {
                         let _ = live_tx.send(msg.to_string().into());
                     }
@@ -784,5 +945,150 @@ mod pending_feed_tests {
             );
             assert_eq!(msg["revision"], feed.revision);
         }
+    }
+
+    fn transaction(txid: TxId, previous: kascov_core::Outpoint) -> kascov_core::Transaction {
+        kascov_core::Transaction {
+            txid,
+            version: 1,
+            inputs: vec![kascov_core::Input {
+                previous_outpoint: previous,
+                signature_script: vec![],
+                compute_budget: 0,
+            }],
+            outputs: vec![],
+            payload: b"ARGI".to_vec(),
+        }
+    }
+
+    #[test]
+    fn new_pending_argent_failure_is_bounded_and_identified() {
+        let txid = TxId([0x71; 32]);
+        let covenant_id = CovenantId([0x72; 32]);
+        let tx = transaction(
+            txid,
+            kascov_core::Outpoint {
+                txid: TxId([0x70; 32]),
+                index: 1,
+            },
+        );
+        let application = kascov_core::ApplicationPreprocess {
+            raw_envelope: Some(b"ARGI".to_vec()),
+            failures: vec![kascov_core::DecodeFailure {
+                output_index: None,
+                application_id: Some("duel".to_string()),
+                artifact_id: None,
+                code: "invalid_envelope".to_string(),
+                detail: "bad envelope".to_string(),
+            }],
+            ..Default::default()
+        };
+        let mut feed = PendingFeed::new();
+        assert_eq!(
+            track_pending_transaction_at(
+                &mut feed,
+                &tx,
+                vec![PendingTxEvent {
+                    covenant_id,
+                    kind: EventKind::Transition,
+                }],
+                application,
+                1_000,
+                std::time::Instant::now(),
+            ),
+            PendingInsert::Added
+        );
+
+        let message = pending_sse_jsons(&feed, &txid).remove(0);
+        assert_eq!(message["kind"], "pending");
+        assert_eq!(message["application"]["status"], "invalid");
+        assert_eq!(
+            message["application"]["failures"][0]["code"],
+            "invalid_envelope"
+        );
+        assert_eq!(
+            message["pending_id"],
+            kascov_core::pending_event_id(txid, covenant_id, 0)
+        );
+        assert!(
+            message.get("id").is_none(),
+            "pending frames have no SSE id field"
+        );
+    }
+
+    #[test]
+    fn replacement_links_the_conflicting_transaction() {
+        let old = TxId([0x81; 32]);
+        let replacement = TxId([0x82; 32]);
+        let previous = kascov_core::Outpoint {
+            txid: TxId([0x80; 32]),
+            index: 2,
+        };
+        let tx = transaction(old, previous);
+        let mut feed = PendingFeed::new();
+        track_pending_transaction_at(
+            &mut feed,
+            &tx,
+            vec![PendingTxEvent {
+                covenant_id: CovenantId([0x83; 32]),
+                kind: EventKind::Transition,
+            }],
+            Default::default(),
+            1_000,
+            std::time::Instant::now(),
+        );
+        let spenders = std::collections::HashMap::from([(previous, replacement)]);
+        let entry = feed.entries.get(&old).unwrap();
+        assert_eq!(Some(replacement), replacement_for(old, entry, &spenders));
+        let frame =
+            pending_resolved_sse_json(&old, entry, "replaced", Some(replacement), 2).unwrap();
+        assert_eq!(frame["resolution"], "replaced");
+        assert_eq!(frame["replaced_by"], replacement.to_string());
+    }
+
+    #[tokio::test]
+    async fn accepted_transaction_resolves_pending_immediately() {
+        let txid = TxId([0x91; 32]);
+        let mut feed = PendingFeed::new();
+        track_pending_transaction_at_ms(
+            &mut feed,
+            txid,
+            vec![PendingTxEvent {
+                covenant_id: CovenantId([0x92; 32]),
+                kind: EventKind::Genesis,
+            }],
+            1_000,
+        );
+        let pending = std::sync::Arc::new(tokio::sync::Mutex::new(feed));
+        let (live_tx, mut live_rx) = tokio::sync::broadcast::channel(4);
+
+        assert_eq!(
+            1,
+            resolve_accepted_pending(&pending, &live_tx, &HashSet::from([txid])).await
+        );
+        let frame: serde_json::Value =
+            serde_json::from_str(&live_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(frame["kind"], "pending_resolved");
+        assert_eq!(frame["resolution"], "accepted");
+        assert_eq!(pending.lock().await.entries.len(), 0);
+    }
+
+    #[test]
+    fn dropped_resolution_is_explicit() {
+        let txid = TxId([0xa1; 32]);
+        let mut feed = PendingFeed::new();
+        track_pending_transaction_at_ms(
+            &mut feed,
+            txid,
+            vec![PendingTxEvent {
+                covenant_id: CovenantId([0xa2; 32]),
+                kind: EventKind::Burn,
+            }],
+            1_000,
+        );
+        let entry = feed.entries.get(&txid).unwrap();
+        let frame = pending_resolved_sse_json(&txid, entry, "dropped", None, 2).unwrap();
+        assert_eq!(frame["resolution"], "dropped");
+        assert!(frame.get("replaced_by").is_none());
     }
 }

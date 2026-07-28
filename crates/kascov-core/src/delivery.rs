@@ -128,6 +128,10 @@ pub enum DeliveryKind {
     ProjectionRepaired,
 }
 
+pub fn pending_event_id(txid: TxId, covenant_id: CovenantId, event_ordinal: u32) -> String {
+    format!("{txid}:{covenant_id}:{event_ordinal}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryRecord {
     pub cursor: StreamCursor,

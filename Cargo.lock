@@ -2260,6 +2260,7 @@ dependencies = [
  "futures",
  "hex",
  "image",
+ "kascov-argent",
  "kascov-core",
  "kascov-decode",
  "kascov-labkit",

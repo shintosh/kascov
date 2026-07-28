@@ -70,6 +70,10 @@ fn pending_matches(msg: &str, covenant: Option<CovenantId>) -> bool {
     covenant.is_none_or(|id| msg.contains(&format!("\"covenant_id\":\"{id}\"")))
 }
 
+fn pending_sse_event(msg: &str) -> axum::response::sse::Event {
+    axum::response::sse::Event::default().data(msg)
+}
+
 /// Push covenant events over SSE the moment the follower indexes them.
 /// Hints only — no replay, no backlog, lagged subscribers skip ahead;
 /// consumers confirm state through the polled feeds.
@@ -160,7 +164,7 @@ pub(super) async fn stream_handler(
                             if !pending_matches(&msg, covenant) { continue; }
                             let event = {
                                 let _delivery = performance.timer(kascov_core::performance::Stage::StreamDelivery);
-                                Event::default().data(&*msg)
+                                pending_sse_event(&msg)
                             };
                             return Some((Ok::<_, std::convert::Infallible>(event), (delivery_rx, pending_rx, slot, covenant, performance)));
                         }
@@ -254,5 +258,20 @@ mod tests {
         assert!(!pending_matches(&pending, Some(other)));
         assert!(delivery_matches(&delivery, None));
         assert!(pending_matches(&pending, None));
+    }
+
+    #[tokio::test]
+    async fn pending_frames_never_emit_an_eventsource_id() {
+        use axum::response::IntoResponse;
+        let stream = futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(pending_sse_event(r#"{"kind":"pending"}"#))
+        });
+        let response = axum::response::sse::Sse::new(stream).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_024)
+            .await
+            .unwrap();
+        let wire = std::str::from_utf8(&bytes).unwrap();
+        assert!(wire.contains("data: {\"kind\":\"pending\"}"));
+        assert!(!wire.lines().any(|line| line.starts_with("id:")));
     }
 }

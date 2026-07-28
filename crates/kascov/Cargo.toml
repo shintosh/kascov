@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 kascov-core = { workspace = true }
+kascov-argent = { workspace = true }
 kascov-decode = { workspace = true }
 kascov-sim = { workspace = true }
 kascov-labkit = { path = "../kascov-labkit" }
