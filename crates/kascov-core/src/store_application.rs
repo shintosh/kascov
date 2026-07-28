@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::application::{ApplicationOutput, DecodeFailure};
-use crate::store::Store;
+use crate::store::{AcceptedBlockBatch, Store};
 use crate::{BlockHash, CovenantId, Error, Result, TxId};
 
 const APPLICATION_SCHEMA: &str = "
@@ -67,6 +67,92 @@ CREATE TABLE IF NOT EXISTS optional_projection_work (
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(APPLICATION_SCHEMA).map_err(db_err)
+}
+
+pub(crate) fn apply_accepted(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &AcceptedBlockBatch,
+) -> Result<()> {
+    for accepted in &batch.transactions {
+        let application = &accepted.application;
+        if let Some(raw_envelope) = &application.raw_envelope {
+            let status = if application.failures.is_empty() {
+                "valid"
+            } else if application.outputs.is_empty() {
+                "failed"
+            } else {
+                "partial"
+            };
+            tx.execute(
+                "INSERT INTO application_envelopes (
+                    txid, accepting_block, accepting_daa, raw_envelope,
+                    application_payload, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    accepted.txid.0.as_slice(),
+                    batch.accepting_block.0.as_slice(),
+                    batch.accepting_daa,
+                    raw_envelope,
+                    application.application_payload.as_deref().unwrap_or_default(),
+                    status,
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        for output in &application.outputs {
+            tx.execute(
+                "INSERT INTO application_outputs (
+                    txid, output_index, covenant_id, application_id,
+                    artifact_id, actor_path, state_json, created_block,
+                    created_daa, spent_block
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                params![
+                    accepted.txid.0.as_slice(),
+                    output.output_index,
+                    output.covenant_id.0.as_slice(),
+                    output.application_id,
+                    output.artifact_id.as_slice(),
+                    output.actor_path,
+                    output.state_json,
+                    batch.accepting_block.0.as_slice(),
+                    batch.accepting_daa,
+                ],
+            )
+            .map_err(db_err)?;
+        }
+        for failure in &application.failures {
+            tx.execute(
+                "INSERT INTO application_decode_failures (
+                    txid, accepting_block, accepting_daa, output_index,
+                    application_id, artifact_id, code, detail
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    accepted.txid.0.as_slice(),
+                    batch.accepting_block.0.as_slice(),
+                    batch.accepting_daa,
+                    failure.output_index,
+                    failure.application_id,
+                    failure.artifact_id.as_ref().map(|id| id.as_slice()),
+                    failure.code,
+                    failure.detail,
+                ],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    for (outpoint, _, _, _, _) in &batch.spent_utxos {
+        tx.execute(
+            "UPDATE application_outputs SET spent_block = ?1
+             WHERE txid = ?2 AND output_index = ?3 AND spent_block IS NULL",
+            params![
+                batch.accepting_block.0.as_slice(),
+                outpoint.txid.0.as_slice(),
+                outpoint.index,
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

@@ -110,8 +110,7 @@ fn worked_example_replays_and_verifies() {
             payload: None,
             lane_namespace: None,
         });
-        let hash = block.accepting_block;
-        store.apply(&block, hash).unwrap();
+        store.apply_accepted_block(&block).unwrap();
     }
 
     // The apply hook derived incrementally; the arithmetic must match the

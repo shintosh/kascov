@@ -127,7 +127,7 @@ pub async fn sync_once_measured_with_decoder(
             tracing::info!("fresh index, starting at {start}");
             {
                 let _commit = performance.timer(Stage::Commit);
-                store.apply(&AcceptedBlockBatch::empty(start), start)?;
+                store.apply_accepted_block(&AcceptedBlockBatch::empty(start))?;
             }
             start
         }
@@ -213,13 +213,13 @@ pub async fn sync_once_measured_with_decoder(
             }
             {
                 let _commit = performance.timer(Stage::Commit);
-                store.apply(&block_events, accepted.accepting_block)?;
+                store.apply_accepted_block(&block_events)?;
             }
             since_checkpoint = 0;
         } else if since_checkpoint >= CHECKPOINT_EVERY {
             {
                 let _commit = performance.timer(Stage::Commit);
-                store.apply(&block_events, accepted.accepting_block)?;
+                store.apply_accepted_block(&block_events)?;
             }
             since_checkpoint = 0;
         }
@@ -239,7 +239,7 @@ pub async fn sync_once_measured_with_decoder(
             let mut checkpoint = AcceptedBlockBatch::empty(cursor);
             checkpoint.accepting_daa = last_daa;
             let _commit = performance.timer(Stage::Commit);
-            store.apply(&checkpoint, cursor)?;
+            store.apply_accepted_block(&checkpoint)?;
         }
     }
     Ok(stats)
@@ -405,9 +405,7 @@ pub async fn re_anchor(node: &impl ChainSource, store: &mut Store) -> Result<ReA
         // Cursor repoint carrying the anchor's own DAA (unlike reset_cursor's
         // bare repoint), so processed_daa is honest immediately instead of
         // overstating progress until the next completed pass.
-        let mut checkpoint = AcceptedBlockBatch::empty(anchor);
-        checkpoint.accepting_daa = anchor_daa;
-        store.apply(&checkpoint, anchor)?;
+        store.checkpoint_cursor(anchor, anchor_daa)?;
         return Ok(ReAnchor::Anchored(anchor));
     }
     Ok(ReAnchor::NothingWalkable)
@@ -1306,20 +1304,17 @@ mod tests {
         // Two accepting blocks; accepted lists carry a coinbase (index 0) and
         // a plain payment that never produced covenant rows.
         store
-            .apply(
+            .apply_accepted_block(
                 &block_events(
                     h(1),
                     100,
                     vec![event(0xA1, tx_id(0xA0), 1), event(0xB2, tx_id(0xB0), 2)],
                 ),
-                h(1),
             )
             .unwrap();
         store
-            .apply(
-                &block_events(h(2), 200, vec![event(0xA1, tx_id(0xC0), 1)]),
-                h(2),
-            )
+            .apply_accepted_block(&block_events(h(2), 200, vec![event(0xA1, tx_id(0xC0), 1)]))
+
             .unwrap();
         store.wipe_tx_indices_for_test().unwrap();
         assert_eq!(
@@ -1409,31 +1404,19 @@ mod tests {
         let db = std::env::temp_dir().join(format!("kascov-sync-{name}-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
         let mut store = Store::open(&db, Network::Testnet(10)).unwrap();
-        store
-            .apply(
-                &block_events(h(1), 100, vec![event(0xA1, tx_id(0xA0), 1)]),
-                h(1),
-            )
-            .unwrap();
+        store.apply_accepted_block(&block_events(h(1), 100, vec![event(0xA1, tx_id(0xA0), 1)])).unwrap();
+
         let mut b2 = block_events(h(2), 200, vec![event(0xB2, tx_id(0xB0), 1)]);
         b2.created_utxos.push(utxo(0xB2, tx_id(0xB0), 0));
-        store.apply(&b2, h(2)).unwrap();
+        store.apply_accepted_block(&b2).unwrap();
         let mut b3 = block_events(h(3), 300, vec![event(0xC3, tx_id(0xC0), 1)]);
         b3.created_utxos.push(utxo(0xC3, tx_id(0xC0), 0));
-        b3.spent_utxos.push((
-            Outpoint {
-                txid: tx_id(0xB0),
-                index: 0,
-            },
-            tx_id(0xC0),
-            vec![0xAA],
-            7,
-            0,
-        ));
-        store.apply(&b3, h(3)).unwrap();
+        b3.spent_utxos.push((Outpoint { txid: tx_id(0xB0), index: 0 }, tx_id(0xC0), vec![0xAA], 7, 0));
+        store.apply_accepted_block(&b3).unwrap();
+
         let mut b4 = block_events(h(4), 400, vec![event(0xA1, tx_id(0xD0), 1)]);
         b4.created_utxos.push(utxo(0xA1, tx_id(0xD0), 0));
-        store.apply(&b4, h(4)).unwrap();
+        store.apply_accepted_block(&b4).unwrap();
         assert_eq!(store.cursor().unwrap(), Some(h(4)));
         store
     }
@@ -1626,17 +1609,10 @@ mod tests {
             std::env::temp_dir().join(format!("kascov-sync-gap-pending-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
         let mut store = Store::open(&db, Network::Testnet(10)).unwrap();
+        store.apply_accepted_block(&block_events(h(1), 100, vec![event(0xA1, tx_id(0xA0), 0)])).unwrap();
         store
-            .apply(
-                &block_events(h(1), 100, vec![event(0xA1, tx_id(0xA0), 0)]),
-                h(1),
-            )
-            .unwrap();
-        store
-            .apply(
-                &block_events(h(2), 2_000_000, vec![event(0xA1, tx_id(0xB0), 0)]),
-                h(2),
-            )
+            .apply_accepted_block(&block_events(h(2), 2_000_000, vec![event(0xA1, tx_id(0xB0), 0)]))
+
             .unwrap();
         store.set_gap_recovery_pending(100, 2_000_000).unwrap();
 
@@ -1684,16 +1660,11 @@ mod tests {
 
         // h1 predates the pruning point (h2); only h3 is walkable.
         store
-            .apply(
-                &block_events(h(1), 100, vec![event(0xA1, tx_id(0xA0), 1)]),
-                h(1),
-            )
+            .apply_accepted_block(&block_events(h(1), 100, vec![event(0xA1, tx_id(0xA0), 1)]))
             .unwrap();
         store
-            .apply(
-                &block_events(h(3), 300, vec![event(0xB2, tx_id(0xB0), 1)]),
-                h(3),
-            )
+            .apply_accepted_block(&block_events(h(3), 300, vec![event(0xB2, tx_id(0xB0), 1)]))
+
             .unwrap();
         store.wipe_tx_indices_for_test().unwrap();
 
@@ -1739,11 +1710,9 @@ mod tests {
         // Seed a confirmed, live covenant UTXO for id 0xB2 at (tx 0xB0, out 0).
         let mut b = block_events(h(1), 100, vec![event(0xB2, tx_id(0xB0), 1)]);
         b.created_utxos.push(utxo(0xB2, tx_id(0xB0), 0));
-        store.apply(&b, h(1)).unwrap();
-        let live = Outpoint {
-            txid: tx_id(0xB0),
-            index: 0,
-        };
+        store.apply_accepted_block(&b).unwrap();
+        let live = Outpoint { txid: tx_id(0xB0), index: 0 };
+
 
         // A one-input, one-output pending-tx builder.
         let mk = |txid: TxId, spend: Option<Outpoint>, out: Output| Transaction {

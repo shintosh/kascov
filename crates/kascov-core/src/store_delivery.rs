@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::delivery::{DeliveryRecord, StreamCursor, StreamEpoch};
 use crate::store::Store;
-use crate::{Error, Result};
+use crate::{BlockHash, Error, Result};
 
 const DELIVERY_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS delivery_log (
@@ -97,6 +97,139 @@ fn add_column(conn: &Connection, sql: &str) -> Result<()> {
         }
         Err(error) => Err(db_err(error)),
     }
+}
+
+pub(crate) fn canonical_batch_daa(
+    tx: &rusqlite::Transaction<'_>,
+    accepting_block: &BlockHash,
+) -> Result<Option<u64>> {
+    tx.query_row(
+        "SELECT accepting_daa FROM canonical_batches WHERE accepting_block = ?1",
+        [accepting_block.0.as_slice()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+pub(crate) fn transaction_stream_epoch(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<StreamEpoch> {
+    let raw = meta(tx, "stream_epoch")?.ok_or_else(|| Error::Invalid {
+        what: "stream epoch",
+        value: "missing".to_owned(),
+    })?;
+    StreamEpoch::from_str(&raw)
+}
+
+pub(crate) fn transaction_next_stream_seq(tx: &rusqlite::Transaction<'_>) -> Result<u64> {
+    parse_meta_u64(tx, "next_stream_seq")
+}
+
+pub(crate) fn insert_delivery(
+    tx: &rusqlite::Transaction<'_>,
+    record: &DeliveryRecord,
+) -> Result<()> {
+    let data_json = serde_json::to_string(record).map_err(|error| Error::Invalid {
+        what: "delivery record",
+        value: error.to_string(),
+    })?;
+    let kind = match record.kind {
+        crate::DeliveryKind::Accepted => "accepted",
+        crate::DeliveryKind::Removed => "removed",
+        crate::DeliveryKind::ProjectionRepaired => "projection_repaired",
+    };
+    tx.execute(
+        "INSERT INTO delivery_log (
+            stream_seq, kind, source_stream_seq, covenant_id,
+            covenant_event_seq, txid, accepting_block, accepting_daa,
+            tx_index, event_index, order_complete, pending_id, data_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            record.cursor.seq,
+            kind,
+            record.source_cursor.map(|cursor| cursor.seq),
+            record.covenant_id.0.as_slice(),
+            record.covenant_event_seq,
+            record.txid.0.as_slice(),
+            record.accepting_block.0.as_slice(),
+            record.accepting_daa,
+            record.tx_index,
+            record.event_index,
+            record.order_complete,
+            record.pending_id,
+            data_json,
+        ],
+    )
+    .map_err(db_err)?;
+    for application in &record.applications {
+        tx.execute(
+            "INSERT INTO delivery_applications (
+                stream_seq, output_index, application_id, artifact_id, actor_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.cursor.seq,
+                application.output_index,
+                application.application_id,
+                application.artifact_id.as_slice(),
+                application.actor_path,
+            ],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_canonical_batch(
+    tx: &rusqlite::Transaction<'_>,
+    accepting_block: &BlockHash,
+    accepting_daa: u64,
+    first_stream_seq: Option<u64>,
+    last_stream_seq: Option<u64>,
+    next_stream_seq: u64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO canonical_batches (
+            accepting_block, accepting_daa, first_stream_seq, last_stream_seq
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            accepting_block.0.as_slice(),
+            accepting_daa,
+            first_stream_seq,
+            last_stream_seq,
+        ],
+    )
+    .map_err(db_err)?;
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'next_stream_seq'",
+        [next_stream_seq.to_string()],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+pub(crate) fn deliveries_for_block(
+    conn: &Connection,
+    accepting_block: &BlockHash,
+) -> Result<Vec<DeliveryRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT data_json FROM delivery_log
+             WHERE accepting_block = ?1 ORDER BY stream_seq",
+        )
+        .map_err(db_err)?;
+    let deliveries = statement
+        .query_map([accepting_block.0.as_slice()], |row| row.get::<_, String>(0))
+        .map_err(db_err)?
+        .map(|row| {
+            let json = row.map_err(db_err)?;
+            serde_json::from_str(&json).map_err(|error| Error::Invalid {
+                what: "delivery record",
+                value: error.to_string(),
+            })
+        })
+        .collect();
+    deliveries
 }
 
 impl Store {
@@ -208,11 +341,62 @@ fn db_err(error: rusqlite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use crate::store::Store;
+    use crate::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent, NewUtxo, Store};
     use crate::{
-        BlockHash, CovenantId, DeliveryKind, DeliveryRecord, Network, StreamCursor, StreamEpoch,
-        TxId,
+        ApplicationOutput, ApplicationPreprocess, BlockHash, CovenantId, DeliveryKind,
+        DecodeFailure, DeliveryRecord, Network, Outpoint, StreamCursor, StreamEpoch, TxId,
     };
+
+    fn accepted_batch(block: u8, txid: u8) -> AcceptedBlockBatch {
+        let covenant_id = CovenantId([1; 32]);
+        let txid = TxId([txid; 32]);
+        let application = ApplicationOutput {
+            output_index: 0,
+            covenant_id,
+            application_id: "counter".into(),
+            artifact_id: [2; 32],
+            actor_path: "Counter".into(),
+            state_json: "{}".into(),
+        };
+        AcceptedBlockBatch {
+            accepting_block: BlockHash([block; 32]),
+            accepting_daa: u64::from(block) * 100,
+            accepting_time_ms: u64::from(block) * 1_000,
+            accepting_blue_score: u64::from(block) * 100,
+            events: vec![NewEvent {
+                covenant_id,
+                kind: EventKind::Genesis,
+                txid,
+                tx_index: 0,
+                event_index: 0,
+                payload: Some(b"ARGI".to_vec()),
+                lane_namespace: None,
+            }],
+            created_utxos: vec![NewUtxo {
+                outpoint: Outpoint { txid, index: 0 },
+                covenant_id,
+                value: 7,
+                spk_version: 0,
+                spk_script: vec![0x51],
+            }],
+            spent_utxos: vec![],
+            transactions: vec![AcceptedTransaction {
+                txid,
+                application: ApplicationPreprocess {
+                    raw_envelope: Some(b"ARGI".to_vec()),
+                    application_payload: Some(b"move".to_vec()),
+                    outputs: vec![application],
+                    failures: vec![DecodeFailure {
+                        output_index: Some(0),
+                        application_id: Some("counter".into()),
+                        artifact_id: Some([2; 32]),
+                        code: "fixture_warning".into(),
+                        detail: "bounded fixture failure".into(),
+                    }],
+                },
+            }],
+        }
+    }
 
     #[test]
     fn fresh_database_has_delivery_identity_and_empty_bounds() {
@@ -335,5 +519,74 @@ mod tests {
                 10,
             )
             .is_err());
+    }
+
+    #[test]
+    fn writer_lease_is_exclusive_and_readers_do_not_take_it() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-writer-lease-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let writer = Store::open(&path, Network::Testnet(10)).unwrap();
+        assert!(Store::open(&path, Network::Testnet(10)).is_err());
+        let reader = Store::open_read_only(&path, Network::Testnet(10)).unwrap();
+        assert_eq!(writer.stream_epoch().unwrap(), reader.stream_epoch().unwrap());
+        drop(reader);
+        drop(writer);
+        Store::open(&path, Network::Testnet(10)).unwrap();
+    }
+
+    #[test]
+    fn accepted_apply_allocates_once_and_duplicate_returns_committed_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-accepted-atomic-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let mut batch = accepted_batch(1, 9);
+
+        let first = store.apply_accepted_block(&batch).unwrap();
+        assert_eq!(1, first.deliveries.len());
+        assert_eq!(1, first.deliveries[0].cursor.seq);
+        assert_eq!(1, first.deliveries[0].applications.len());
+        assert_eq!(1, store.delivery_high_water().unwrap().seq);
+        assert!(store
+            .current_application_output("counter", "Counter", &CovenantId([1; 32]))
+            .unwrap()
+            .is_some());
+        assert_eq!(1, store.decode_failures(10).unwrap().len());
+
+        batch.accepting_daa = 999;
+        let duplicate = store.apply_accepted_block(&batch).unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(1, store.delivery_high_water().unwrap().seq);
+
+        let second = store.apply_accepted_block(&accepted_batch(2, 10)).unwrap();
+        assert_eq!(2, second.deliveries[0].cursor.seq);
+    }
+
+    #[test]
+    fn delivery_insert_failure_rolls_back_every_accepted_write() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-accepted-failure-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_delivery BEFORE INSERT ON delivery_log
+                 BEGIN SELECT RAISE(ABORT, 'test delivery failure'); END;",
+            )
+            .unwrap();
+
+        assert!(store.apply_accepted_block(&accepted_batch(1, 9)).is_err());
+        assert!(!store.known_covenant(&CovenantId([1; 32])).unwrap());
+        assert_eq!(0, store.delivery_high_water().unwrap().seq);
+        assert!(store.cursor().unwrap().is_none());
+        assert!(store.application_history("counter", "Counter", 10).unwrap().is_empty());
     }
 }

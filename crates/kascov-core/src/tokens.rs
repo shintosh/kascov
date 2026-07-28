@@ -5,7 +5,7 @@
 //! Design contract (the conservative core of the feature):
 //!
 //! * One pure function, [`derive_token`], recomputes a token's entire derived
-//!   state from the two source tables. The write hook in `Store::apply`, the
+//!   state from the two source tables. The write hook in `Store::apply_accepted_block`, the
 //!   reorg rewind in `Store::rollback`, and the versioned boot pass
 //!   [`Store::derive_tokens_if_stale`] all call it — one truth, no
 //!   incremental delta-patcher that could drift (spend-time reveals
@@ -2102,8 +2102,7 @@ mod tests {
             self
         }
         fn apply(self, store: &mut Store) {
-            let hash = self.block.accepting_block;
-            store.apply(&self.block, hash).unwrap();
+            store.apply_accepted_block(&self.block).unwrap();
         }
     }
 

@@ -9992,7 +9992,7 @@ mod galaxy_tests {
             spent_utxos: vec![],
             transactions: vec![],
         };
-        store.apply(&block, BlockHash([1; 32])).unwrap();
+        store.apply_accepted_block(&block).unwrap();
         store
     }
 
@@ -10997,7 +10997,7 @@ mod feed_and_sitemap_tests {
             spent_utxos: vec![],
             transactions: vec![],
         };
-        store.apply(&block, BlockHash([1; 32])).unwrap();
+        store.apply_accepted_block(&block).unwrap();
         // Tip 1,000 DAA past the event: the coin's lastmod anchors 100s back.
         store.set_tip(2_000, 1_700_000_100_000).unwrap();
 
@@ -11126,7 +11126,7 @@ mod feed_and_sitemap_tests {
             spent_utxos: vec![],
             transactions: vec![],
         };
-        store.apply(&block, BlockHash([1; 32])).unwrap();
+        store.apply_accepted_block(&block).unwrap();
         store.set_tip(1_000, 1_700_000_000_000).unwrap();
 
         let html = share_body_extra(&store, &id).unwrap();
