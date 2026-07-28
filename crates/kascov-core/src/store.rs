@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::model::*;
 use crate::{Error, Result};
 
-const SCHEMA: &str = "
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -344,7 +344,7 @@ CREATE INDEX IF NOT EXISTS mp_unknown ON market_programs(program_hash, covenant_
 ";
 
 pub struct Store {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 /// One decoded token an address holds.
@@ -1234,6 +1234,16 @@ impl Store {
             })?;
         }
         let conn = Connection::open(path).map_err(db_err)?;
+        let legacy_schema = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'covenant_events'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;
         // Concurrent readers (backup, serve snapshots) must wait out write
@@ -1336,6 +1346,8 @@ impl Store {
                 }
             }
         }
+        crate::store_delivery::migrate(&conn, legacy_schema)?;
+        crate::store_application::migrate(&conn)?;
         // Partial "todo" indexes keep the backfill probe below O(1) once every
         // row is stamped. They reference the columns added above, so they must
         // be created here (after the ALTERs), never inside SCHEMA — and unlike

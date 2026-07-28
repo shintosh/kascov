@@ -7,6 +7,8 @@ pub mod model;
 pub mod node;
 pub mod performance;
 pub mod store;
+pub mod store_application;
+pub mod store_delivery;
 pub mod sync;
 pub mod tokens;
 
