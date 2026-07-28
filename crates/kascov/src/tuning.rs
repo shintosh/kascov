@@ -1,5 +1,5 @@
-pub const PROFILE_VERSION: u32 = 0;
-pub const PROFILE_STATUS: &str = "initial";
+pub const PROFILE_VERSION: u32 = 1;
+pub const PROFILE_STATUS: &str = "selected";
 
 pub const FETCH_AHEAD_CANDIDATES: [usize; 4] = [8, 16, 32, 64];
 pub const WAL_AUTOCHECKPOINT_CANDIDATES: [u32; 3] = [1_000, 4_000, 16_000];
@@ -8,7 +8,7 @@ pub const REPLAY_PAGE_CANDIDATES: [u64; 3] = [256, 512, 1_024];
 
 pub const DEFAULT_FETCH_AHEAD: usize = 16;
 pub const DEFAULT_WAL_AUTOCHECKPOINT: u32 = 1_000;
-pub const DEFAULT_READ_POOL: u32 = 8;
+pub const DEFAULT_READ_POOL: u32 = 4;
 pub const DEFAULT_REPLAY_PAGE: u64 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,13 +80,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initial_profile_is_valid_and_visible() {
+    fn selected_profile_is_valid_and_visible() {
         let profile = TuningProfile::default().validate().unwrap();
         assert_eq!(16, profile.fetch_ahead);
         assert_eq!(1_000, profile.wal_autocheckpoint);
-        assert_eq!(8, profile.read_pool);
+        assert_eq!(4, profile.read_pool);
         assert_eq!(512, profile.replay_page);
-        assert_eq!(0, profile.health_json()["profile_version"]);
+        assert_eq!(1, profile.health_json()["profile_version"]);
+        assert_eq!("selected", profile.health_json()["profile_status"]);
         assert_eq!(DEFAULT_FETCH_AHEAD, kascov_core::sync::DEFAULT_FETCH_AHEAD);
         assert_eq!(
             DEFAULT_WAL_AUTOCHECKPOINT,

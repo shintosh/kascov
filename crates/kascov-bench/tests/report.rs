@@ -75,3 +75,34 @@ fn report_separates_fixture_from_live_samples() {
     live["sample_source"] = json!("mixed");
     assert!(fixture::validate_report(&live).is_err());
 }
+
+#[test]
+fn emitted_report_exposes_the_selected_stage_2_tuple() {
+    let output = std::env::temp_dir().join(format!(
+        "kascov-bench-selected-profile-{}.json",
+        std::process::id()
+    ));
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_kascov-bench"))
+        .args([
+            "fixture",
+            "--blocks",
+            "100",
+            "--events-per-block",
+            "4",
+            "--output",
+        ])
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+    std::fs::remove_file(output).unwrap();
+    assert_eq!(1, report["tuning"]["profile_version"]);
+    assert_eq!("selected", report["tuning"]["profile_status"]);
+    assert_eq!(16, report["tuning"]["fetch_ahead"]);
+    assert_eq!(1_000, report["tuning"]["wal_autocheckpoint_pages"]);
+    assert_eq!(4, report["tuning"]["read_pool_connections"]);
+    assert_eq!(512, report["tuning"]["replay_page_records"]);
+}

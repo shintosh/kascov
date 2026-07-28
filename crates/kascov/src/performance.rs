@@ -124,6 +124,18 @@ mod tests {
         assert_eq!(0, snapshot["serialization"]["count"]);
     }
 
+    #[test]
+    fn tuning_snapshot_exposes_the_selected_stage_2_tuple() {
+        let snapshot = crate::tuning::TuningProfile::default().health_json();
+
+        assert_eq!(1, snapshot["profile_version"]);
+        assert_eq!("selected", snapshot["profile_status"]);
+        assert_eq!(16, snapshot["fetch_ahead"]);
+        assert_eq!(1_000, snapshot["wal_autocheckpoint_pages"]);
+        assert_eq!(4, snapshot["read_pool_connections"]);
+        assert_eq!(512, snapshot["replay_page_records"]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn schedule_reconciles_immediately_on_start() {
         let (_, wakeups) = kascov_core::node::chain_wakeup_channel();

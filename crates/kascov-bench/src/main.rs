@@ -9,6 +9,8 @@ const FETCH_AHEAD: [usize; 4] = [8, 16, 32, 64];
 const WAL_AUTOCHECKPOINT: [u32; 3] = [1_000, 4_000, 16_000];
 const READ_POOL: [u32; 3] = [4, 8, 16];
 const REPLAY_PAGE: [u64; 3] = [256, 512, 1_024];
+const PROFILE_VERSION: u32 = 1;
+const PROFILE_STATUS: &str = "selected";
 
 #[derive(Args, Clone, Copy, Debug)]
 struct TuningArgs {
@@ -16,7 +18,7 @@ struct TuningArgs {
     fetch_ahead: usize,
     #[arg(long, default_value_t = 1_000)]
     wal_autocheckpoint: u32,
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 4)]
     read_pool: u32,
     #[arg(long, default_value_t = 512)]
     replay_page: u64,
@@ -45,8 +47,8 @@ impl TuningArgs {
 
     fn json(self) -> serde_json::Value {
         serde_json::json!({
-            "profile_version": 0,
-            "profile_status": "initial",
+            "profile_version": PROFILE_VERSION,
+            "profile_status": PROFILE_STATUS,
             "fetch_ahead": self.fetch_ahead,
             "wal_autocheckpoint_pages": self.wal_autocheckpoint,
             "read_pool_connections": self.read_pool,
@@ -103,32 +105,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_candidates_and_initial_tuple_validate() {
-        let initial = TuningArgs {
+    fn fixed_candidates_and_selected_tuple_validate() {
+        let selected = TuningArgs {
             fetch_ahead: 16,
             wal_autocheckpoint: 1_000,
-            read_pool: 8,
+            read_pool: 4,
             replay_page: 512,
         };
-        assert!(initial.validate().is_ok());
-        assert_eq!(0, initial.json()["profile_version"]);
+        assert!(selected.validate().is_ok());
+        assert_eq!(1, selected.json()["profile_version"]);
+        assert_eq!("selected", selected.json()["profile_status"]);
 
         for invalid in [
             TuningArgs {
                 fetch_ahead: 7,
-                ..initial
+                ..selected
             },
             TuningArgs {
                 wal_autocheckpoint: 999,
-                ..initial
+                ..selected
             },
             TuningArgs {
                 read_pool: 3,
-                ..initial
+                ..selected
             },
             TuningArgs {
                 replay_page: 255,
-                ..initial
+                ..selected
             },
         ] {
             assert!(invalid.validate().is_err());
