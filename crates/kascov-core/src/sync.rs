@@ -922,7 +922,7 @@ fn reconcile_block(
                 touched.push(id);
             }
         }
-        for covenant_id in touched {
+        for (event_index, covenant_id) in touched.into_iter().enumerate() {
             // Emitted as Burn: if the tx had ALSO bound outputs to this
             // covenant, production already holds its (transition) event and
             // the merge dedups this one away — so every event that actually
@@ -933,6 +933,7 @@ fn reconcile_block(
                 kind: EventKind::Burn,
                 txid: tx.txid,
                 tx_index,
+                event_index: event_index as u32,
                 payload: (!tx.payload.is_empty()).then(|| tx.payload.clone()),
                 lane_namespace: crate::store::lane_namespace(&tx.payload),
             });
@@ -1004,7 +1005,9 @@ fn classify<'a>(
             });
         }
 
-        for (covenant_id, (spent, created)) in touched {
+        let mut touched: Vec<_> = touched.into_iter().collect();
+        touched.sort_unstable_by_key(|(covenant_id, _)| covenant_id.0);
+        for (event_index, (covenant_id, (spent, created))) in touched.into_iter().enumerate() {
             let kind = if spent > 0 && created > 0 {
                 EventKind::Transition
             } else if spent > 0 {
@@ -1027,6 +1030,7 @@ fn classify<'a>(
                 kind,
                 txid: tx.txid,
                 tx_index,
+                event_index: event_index as u32,
                 payload: (!tx.payload.is_empty()).then(|| tx.payload.clone()),
                 lane_namespace: crate::store::lane_namespace(&tx.payload),
             });
@@ -1168,6 +1172,7 @@ mod tests {
             kind: EventKind::Genesis,
             txid,
             tx_index,
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         }
@@ -1178,6 +1183,65 @@ mod tests {
         block.accepting_daa = daa;
         block.events = events;
         block
+    }
+
+    #[test]
+    fn accepted_events_have_stable_indices_within_a_transaction() {
+        let db = std::env::temp_dir()
+            .join(format!("kascov-sync-event-index-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db, Network::Testnet(10)).unwrap();
+        let tx = Transaction {
+            txid: tx_id(9),
+            version: 1,
+            inputs: vec![],
+            outputs: vec![
+                Output {
+                    value: 1,
+                    spk_version: 0,
+                    spk_script: vec![],
+                    covenant: Some(CovenantBinding {
+                        covenant_id: CovenantId([0x22; 32]),
+                        authorizing_input: 0,
+                    }),
+                },
+                Output {
+                    value: 1,
+                    spk_version: 0,
+                    spk_script: vec![],
+                    covenant: Some(CovenantBinding {
+                        covenant_id: CovenantId([0x11; 32]),
+                        authorizing_input: 0,
+                    }),
+                },
+            ],
+            payload: vec![],
+        };
+        let accepted = AcceptedBlock {
+            accepting_block: h(1),
+            accepted_tx_ids: vec![tx.txid],
+        };
+        let accepting = Block {
+            hash: h(1),
+            daa_score: 1,
+            blue_score: 1,
+            timestamp_ms: 1,
+            parents: vec![],
+            mergeset: vec![],
+            transactions: vec![],
+        };
+
+        let events = classify(&store, &accepted, &accepting, [(7, &tx)].into_iter())
+            .unwrap()
+            .events;
+        assert_eq!(
+            vec![(CovenantId([0x11; 32]), 0), (CovenantId([0x22; 32]), 1)],
+            events
+                .iter()
+                .map(|event| (event.covenant_id, event.event_index))
+                .collect::<Vec<_>>()
+        );
+        assert!(events.iter().all(|event| event.tx_index == 7));
     }
 
     /// The retention-window walk stamps NULL rows with the node's acceptance

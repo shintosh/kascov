@@ -862,6 +862,8 @@ pub struct NewEvent {
     /// 0-based index of the tx in the accepting block's accepted-tx list —
     /// the node's acceptance order, which is the UTXO application order.
     pub tx_index: u32,
+    /// Zero-based classifier order within this accepted transaction.
+    pub event_index: u32,
     /// The tx's v1 payload, stored only when non-empty.
     pub payload: Option<Vec<u8>>,
     /// The KIP-21 lane namespace (4-byte app tag, hex) when the payload has the
@@ -1437,6 +1439,21 @@ impl Store {
                 )));
             }
             Some(_) => {}
+        }
+        if store.meta("stream_epoch")?.is_none() {
+            let stream_epoch = crate::delivery::StreamEpoch::generate().map_err(|err| {
+                Error::Invalid {
+                    what: "stream epoch entropy",
+                    value: err.to_string(),
+                }
+            })?;
+            store
+                .conn
+                .execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('stream_epoch', ?1)",
+                    [stream_epoch.to_string()],
+                )
+                .map_err(db_err)?;
         }
         // After the ownership check — a wrong-network database is never
         // mutated. Stale generic stamps are cleared before the backfills so
@@ -6103,6 +6120,21 @@ mod tests {
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
     }
 
+    #[test]
+    fn stream_epoch_is_generated_once_per_database() {
+        let path = test_store_path("stream-epoch");
+        let first = Store::open(&path, Network::Testnet(10)).unwrap();
+        let first_epoch = first.meta("stream_epoch").unwrap().unwrap();
+        assert_eq!(32, first_epoch.len());
+        drop(first);
+
+        let second = Store::open(&path, Network::Testnet(10)).unwrap();
+        assert_eq!(
+            first_epoch,
+            second.meta("stream_epoch").unwrap().unwrap()
+        );
+    }
+
     fn block_with_events(hash: u8, daa: u64, events: Vec<(u8, EventKind, u8)>) -> BlockEvents {
         BlockEvents {
             accepting_block: BlockHash([hash; 32]),
@@ -6117,6 +6149,7 @@ mod tests {
                     kind,
                     txid: TxId([tx; 32]),
                     tx_index: i as u32,
+                    event_index: 0,
                     payload: None,
                     lane_namespace: None,
                 })
@@ -6381,6 +6414,7 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([1; 32]),
                     tx_index: 0,
+                    event_index: 0,
                     payload: None,
                     lane_namespace: None,
                 },
@@ -6389,6 +6423,7 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([2; 32]),
                     tx_index: 1,
+                    event_index: 0,
                     payload: None,
                     lane_namespace: None,
                 },
@@ -6397,6 +6432,7 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([3; 32]),
                     tx_index: 2,
+                    event_index: 0,
                     payload: None,
                     lane_namespace: None,
                 },
@@ -6405,9 +6441,9 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([4; 32]),
                     tx_index: 3,
+                    event_index: 0,
                     payload: None,
                     lane_namespace: None,
-                },
             ],
             created_utxos: vec![],
             spent_utxos: vec![],
@@ -6476,6 +6512,7 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([1; 32]),
                     tx_index: 0,
+                    event_index: 0,
                     payload: Some(lane_payload.clone()),
                     lane_namespace: Some(lane_ns.clone()),
                 },
@@ -6486,6 +6523,7 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([2; 32]),
                     tx_index: 1,
+                    event_index: 0,
                     payload: Some(vec![0xaa, 0xbb, 0xcc, 0xdd, 0x01]),
                     lane_namespace: None,
                 },
@@ -6596,6 +6634,7 @@ mod tests {
                     kind: EventKind::Genesis,
                     txid: TxId([1; 32]),
                     tx_index: 0,
+                    event_index: 0,
                     payload: Some(payload),
                     lane_namespace: None,
                 }],
@@ -6633,6 +6672,7 @@ mod tests {
             kind: EventKind::Genesis,
             txid: TxId([tx; 32]),
             tx_index: tx as u32,
+            event_index: 0,
             payload,
             lane_namespace: lane,
         };
@@ -7392,6 +7432,7 @@ mod tests {
             kind: EventKind::Transition,
             txid: TxId([tx; 32]),
             tx_index: tx as u32,
+            event_index: 0,
             payload: Some(lane_payload.clone()),
             lane_namespace: lane.map(str::to_string),
         };
@@ -7485,6 +7526,7 @@ mod tests {
             kind: EventKind::Genesis,
             txid: tx1,
             tx_index: 0,
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         }];
@@ -7508,6 +7550,7 @@ mod tests {
                 kind: EventKind::Transition,
                 txid: tx2,
                 tx_index: 3,
+                event_index: 0,
                 payload: None,
                 lane_namespace: None,
             },
@@ -7516,6 +7559,7 @@ mod tests {
                 kind: EventKind::Genesis,
                 txid: tx2,
                 tx_index: 3,
+                event_index: 1,
                 payload: None,
                 lane_namespace: None,
             },
@@ -7561,6 +7605,7 @@ mod tests {
             kind: EventKind::Transition,
             txid: tx3,
             tx_index: 0,
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         }];
@@ -7771,6 +7816,7 @@ mod tests {
             kind: EventKind::Genesis,
             txid: TxId([tx; 32]),
             tx_index,
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         };
@@ -7852,6 +7898,7 @@ mod tests {
             kind: EventKind::Genesis,
             txid: TxId([tx; 32]),
             tx_index,
+            event_index: 0,
             payload: (tx == 0x20).then(|| vec![0u8; tx as usize]),
             lane_namespace: None,
         };

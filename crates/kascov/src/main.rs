@@ -9950,6 +9950,7 @@ mod galaxy_tests {
             kind,
             txid: TxId([tx; 32]),
             tx_index: tx as u32,
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         }
@@ -10987,6 +10988,7 @@ mod feed_and_sitemap_tests {
                 kind: EventKind::Genesis,
                 txid: TxId([0x10; 32]),
                 tx_index: 0,
+                event_index: 0,
                 payload: None,
                 lane_namespace: None,
             }],
@@ -11082,6 +11084,7 @@ mod feed_and_sitemap_tests {
             kind: EventKind::Genesis,
             txid: TxId([0x10; 32]),
             tx_index: 0,
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         }];
@@ -11091,6 +11094,7 @@ mod feed_and_sitemap_tests {
                 kind: EventKind::Transition,
                 txid: TxId([i; 32]),
                 tx_index: i as u32,
+                event_index: 0,
                 payload: None,
                 lane_namespace: None,
             });

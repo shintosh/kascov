@@ -2033,6 +2033,7 @@ mod tests {
                 kind,
                 txid: TxId(txid),
                 tx_index,
+                event_index: 0,
                 payload: None,
                 lane_namespace: None,
             });

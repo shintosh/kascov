@@ -2231,6 +2231,7 @@ version = "0.1.0"
 dependencies = [
  "blake2b_simd",
  "futures",
+ "getrandom 0.3.4",
  "hex",
  "kascov-decode",
  "kaspa-addresses",

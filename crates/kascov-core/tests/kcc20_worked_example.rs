@@ -106,6 +106,7 @@ fn worked_example_replays_and_verifies() {
             },
             txid: TxId(h32(&ev.txid)),
             tx_index: ev.tx_index.unwrap_or(0),
+            event_index: 0,
             payload: None,
             lane_namespace: None,
         });
