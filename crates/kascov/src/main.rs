@@ -2,6 +2,7 @@
 
 mod api;
 mod og;
+mod performance;
 mod preflight;
 mod registry;
 mod witness;
@@ -1522,6 +1523,12 @@ struct ServeState {
     tool_limiter: tokio::sync::Mutex<ToolLimiter>,
     /// Follower liveness per network (same Vec-not-HashMap shape as `live`).
     sync_health: Vec<(Network, std::sync::Arc<SyncHealth>)>,
+    /// Fixed-stage latency metrics per network. Stage names are compile-time
+    /// constants, so user or route values never become metric labels.
+    performance: Vec<(
+        Network,
+        std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
+    )>,
     /// Serializes custodial deploys: they all spend from one funding wallet, so
     /// concurrent builds would pick the same UTXO and double-spend. One in flight.
     deploy_inflight: tokio::sync::Mutex<()>,
@@ -1715,6 +1722,26 @@ async fn shell_handler(uri: axum::http::Uri) -> axum::response::Response {
         .into_response()
 }
 
+fn performance_for_key(
+    state: &ServeState,
+    key: &str,
+) -> std::sync::Arc<kascov_core::performance::PerformanceMetrics> {
+    key.split('/')
+        .next()
+        .and_then(|name| name.parse::<Network>().ok())
+        .and_then(|network| {
+            state
+                .performance
+                .iter()
+                .find(|(candidate, _)| *candidate == network)
+        })
+        // Aggregate endpoints such as the feed and sitemap have no network
+        // key. Charge their bounded work to the first configured network.
+        .or_else(|| state.performance.first())
+        .map(|(_, metrics)| metrics.clone())
+        .expect("serve requires at least one configured network")
+}
+
 async fn serve(
     cli: &Cli,
     listen: String,
@@ -1744,8 +1771,10 @@ async fn serve(
     let mut live = Vec::with_capacity(networks.len());
     let mut sync_health = Vec::with_capacity(networks.len());
     let mut pending = Vec::with_capacity(networks.len());
+    let mut network_performance = Vec::with_capacity(networks.len());
     for &network in &networks {
         let channel = LiveChannel::new();
+        let metrics = std::sync::Arc::new(kascov_core::performance::PerformanceMetrics::new());
         let health = std::sync::Arc::new(SyncHealth {
             last_sync_ok_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
             last_progress_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
@@ -1768,6 +1797,7 @@ async fn serve(
             channel.tx.clone(),
             hook_tx,
             health.clone(),
+            metrics.clone(),
         ));
         // Live pending (mempool) covenant feed: an additive, isolated poller
         // that reads the same node the follower confirms against, keeps its
@@ -1784,6 +1814,7 @@ async fn serve(
         live.push((network, channel));
         sync_health.push((network, health));
         pending.push((network, pending_set));
+        network_performance.push((network, metrics));
     }
 
     let consistency = networks
@@ -1798,6 +1829,7 @@ async fn serve(
         deploy_limiter: tokio::sync::Mutex::new(DeployLimiter::new()),
         tool_limiter: tokio::sync::Mutex::new(ToolLimiter::new()),
         sync_health,
+        performance: network_performance,
         deploy_inflight: tokio::sync::Mutex::new(()),
         live,
         pending,
@@ -2105,6 +2137,12 @@ async fn healthz_handler(
         };
         let (processed, tip, backfill_done) = indexed.unwrap_or((None, None, false));
         let lag = tip.zip(processed).map(|(t, p)| t.saturating_sub(p));
+        let performance = state
+            .performance
+            .iter()
+            .find(|(candidate, _)| *candidate == network)
+            .map(|(_, metrics)| performance::snapshot_json(metrics))
+            .expect("every configured network has performance metrics");
         let network_stalled = now.saturating_sub(last_ok) > HEALTHZ_STALL_MS
             || (lag.is_some_and(|l| l > kascov_core::sync::WEDGE_LAG_DAA)
                 && now.saturating_sub(last_progress) > HEALTHZ_STALL_MS);
@@ -2132,6 +2170,7 @@ async fn healthz_handler(
                 "last_progress_ms": last_progress,
                 "tx_index_backfill_done": backfill_done,
                 "mempool": mempool,
+                "performance": performance,
             }),
         );
     }
@@ -2232,6 +2271,7 @@ async fn follow_forever(
     live_tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
     hook_tx: tokio::sync::mpsc::Sender<HookEvent>,
     health: std::sync::Arc<SyncHealth>,
+    performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
 ) {
     use kascov_core::sync::SyncUpdate;
     // Per-network node override: KASCOV_RPC_TESTNET_10 / KASCOV_RPC_MAINNET.
@@ -2324,58 +2364,62 @@ async fn follow_forever(
         }
         tracing::info!("{network}: following the chain");
         loop {
-            let result =
-                kascov_core::sync::sync_once(&node, &mut store, None, |update| match update {
-                    SyncUpdate::Event {
+            let publication = performance.clone();
+            let result = kascov_core::sync::sync_once_measured(
+                &node,
+                &mut store,
+                None,
+                &performance,
+                |update| match update {
+                SyncUpdate::Event { covenant_id, kind, txid, accepting_daa, tx_index } => {
+                    let _publication =
+                        publication.timer(kascov_core::performance::Stage::Publication);
+                    tracing::info!("{network}: {} covenant {covenant_id}", kind.as_str());
+                    // Fan out to any open SSE streams; serialization is skipped
+                    // entirely when nobody is listening, and send() failing
+                    // (zero receivers) is fine.
+                    if live_tx.receiver_count() > 0 {
+                        let msg = serde_json::json!({
+                            "covenant_id": covenant_id,
+                            "kind": kind.as_str(),
+                            "txid": txid,
+                            "accepting_daa": accepting_daa,
+                            "tx_index": tx_index,
+                        })
+                        .to_string();
+                        let _ = live_tx.send(msg.into());
+                    }
+                    // Webhook queue: try_send so a slow/stalled delivery task
+                    // can never block the indexer — under backpressure (e.g.
+                    // the initial full sync) extra events are dropped, which
+                    // is fine: webhooks are hints, not a durable feed.
+                    let _ = hook_tx.try_send(HookEvent {
                         covenant_id,
-                        kind,
+                        kind: kind.as_str(),
                         txid,
                         accepting_daa,
                         tx_index,
-                    } => {
-                        tracing::info!("{network}: {} covenant {covenant_id}", kind.as_str());
-                        // Fan out to any open SSE streams; serialization is skipped
-                        // entirely when nobody is listening, and send() failing
-                        // (zero receivers) is fine.
-                        if live_tx.receiver_count() > 0 {
-                            let msg = serde_json::json!({
-                                "covenant_id": covenant_id,
-                                "kind": kind.as_str(),
-                                "txid": txid,
-                                "accepting_daa": accepting_daa,
-                                "tx_index": tx_index,
-                            })
-                            .to_string();
-                            let _ = live_tx.send(msg.into());
-                        }
-                        // Webhook queue: try_send so a slow/stalled delivery task
-                        // can never block the indexer — under backpressure (e.g.
-                        // the initial full sync) extra events are dropped, which
-                        // is fine: webhooks are hints, not a durable feed.
-                        let _ = hook_tx.try_send(HookEvent {
-                            covenant_id,
-                            kind: kind.as_str(),
-                            txid,
-                            accepting_daa,
-                            tx_index,
-                        });
+                    });
+                }
+                SyncUpdate::Reorg { rolled_back } => {
+                    let _publication =
+                        publication.timer(kascov_core::performance::Stage::Publication);
+                    tracing::info!("{network}: reorg — rolled back {rolled_back} chain blocks");
+                    // Same fire-and-forget fan-out as events; the "kind":"reorg"
+                    // tag lets subscribers distinguish it from covenant activity.
+                    if live_tx.receiver_count() > 0 {
+                        let msg = serde_json::json!({
+                            "kind": "reorg",
+                            "rolled_back": rolled_back,
+                        })
+                        .to_string();
+                        let _ = live_tx.send(msg.into());
                     }
-                    SyncUpdate::Reorg { rolled_back } => {
-                        tracing::info!("{network}: reorg — rolled back {rolled_back} chain blocks");
-                        // Same fire-and-forget fan-out as events; the "kind":"reorg"
-                        // tag lets subscribers distinguish it from covenant activity.
-                        if live_tx.receiver_count() > 0 {
-                            let msg = serde_json::json!({
-                                "kind": "reorg",
-                                "rolled_back": rolled_back,
-                            })
-                            .to_string();
-                            let _ = live_tx.send(msg.into());
-                        }
-                    }
-                    SyncUpdate::Progress(_) => {}
-                })
-                .await;
+                }
+                SyncUpdate::Progress(_) => {}
+            },
+            )
+            .await;
             match result {
                 Ok(_) => {
                     consecutive_errors = 0;
@@ -4293,6 +4337,7 @@ async fn serve_cached(
     use axum::response::IntoResponse;
 
     let ttl = std::time::Duration::from_secs(ttl_secs);
+    let metrics = performance_for_key(state, &key);
     let fresh_body = |cache: &BodyCache| {
         cache
             .get(&key)
@@ -4319,6 +4364,7 @@ async fn serve_cached(
         // key nobody needs a second one, and the caller is served either way.
         let st = state.clone();
         let k = key.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
             let key_lock = {
                 st.build_locks
@@ -4331,9 +4377,18 @@ async fn serve_cached(
             let Ok(_building) = key_lock.try_lock() else {
                 return;
             };
-            match tokio::task::spawn_blocking(build).await {
+            let query_metrics = metrics.clone();
+            match tokio::task::spawn_blocking(move || {
+                performance::timed(&query_metrics, kascov_core::performance::Stage::Query, build)
+            })
+            .await
+            {
                 Ok(Ok(Some(json))) => {
-                    let built = std::sync::Arc::new(CachedBody::new(json));
+                    let built = std::sync::Arc::new(performance::timed(
+                        &metrics,
+                        kascov_core::performance::Stage::Serialization,
+                        || CachedBody::new(json),
+                    ));
                     let mut cache = st.cache.lock().await;
                     evict_cache_if_large(&mut cache);
                     cache.insert(k, (std::time::Instant::now(), built));
@@ -4362,9 +4417,18 @@ async fn serve_cached(
         let _building = key_lock.lock().await;
         body = fresh_body(&*state.cache.lock().await);
         if body.is_none() {
-            match tokio::task::spawn_blocking(build).await {
+            let query_metrics = metrics.clone();
+            match tokio::task::spawn_blocking(move || {
+                performance::timed(&query_metrics, kascov_core::performance::Stage::Query, build)
+            })
+            .await
+            {
                 Ok(Ok(Some(json))) => {
-                    let built = std::sync::Arc::new(CachedBody::new(json));
+                    let built = std::sync::Arc::new(performance::timed(
+                        &metrics,
+                        kascov_core::performance::Stage::Serialization,
+                        || CachedBody::new(json),
+                    ));
                     let mut cache = state.cache.lock().await;
                     // Detail keys accumulate — bound the map before it becomes a
                     // slow leak (grid/live keys are refreshed in place).
@@ -10907,6 +10971,12 @@ async fn stream_handler(
     let Some((_, channel)) = state.live.iter().find(|(n, _)| *n == network) else {
         return (StatusCode::NOT_FOUND, "unknown network").into_response();
     };
+    let performance = state
+        .performance
+        .iter()
+        .find(|(candidate, _)| *candidate == network)
+        .map(|(_, metrics)| metrics.clone())
+        .expect("every configured network has performance metrics");
     // Reserve a subscriber slot; back out over the cap.
     if channel.subscribers.fetch_add(1, Ordering::AcqRel) >= MAX_STREAM_SUBSCRIBERS {
         channel.subscribers.fetch_sub(1, Ordering::AcqRel);
@@ -10927,8 +10997,8 @@ async fn stream_handler(
     // cleanly and well-behaved clients (EventSource) reconnect on their own.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     let stream = futures::stream::unfold(
-        (rx, slot, needle),
-        move |(mut rx, slot, needle)| async move {
+        (rx, slot, needle, performance),
+        move |(mut rx, slot, needle, performance)| async move {
             loop {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
                     Ok(Ok(msg)) => {
@@ -10937,10 +11007,14 @@ async fn stream_handler(
                         if !sse_event_matches(&msg, needle.as_deref()) {
                             continue;
                         }
-                        let event = Event::default().data(&*msg);
+                        let event = {
+                            let _delivery = performance
+                                .timer(kascov_core::performance::Stage::StreamDelivery);
+                            Event::default().data(&*msg)
+                        };
                         return Some((
                             Ok::<_, std::convert::Infallible>(event),
-                            (rx, slot, needle),
+                            (rx, slot, needle, performance),
                         ));
                     }
                     // Fell behind the buffer: skip ahead — clients resync by polling.

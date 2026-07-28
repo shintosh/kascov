@@ -8,6 +8,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::model::*;
 use crate::node::ChainSource;
+use crate::performance::{PerformanceMetrics, Stage};
 use crate::store::{BlockEvents, EventKind, NewEvent, NewUtxo, Store};
 use crate::Result;
 
@@ -49,8 +50,21 @@ pub async fn sync_once(
     node: &impl ChainSource,
     store: &mut Store,
     from: Option<BlockHash>,
+    updates: impl FnMut(SyncUpdate),
+) -> Result<SyncStats> {
+    sync_once_measured(node, store, from, &PerformanceMetrics::new(), updates).await
+}
+
+/// Process one pass while recording bounded stage latency into the caller's
+/// per-network metrics owner.
+pub async fn sync_once_measured(
+    node: &impl ChainSource,
+    store: &mut Store,
+    from: Option<BlockHash>,
+    performance: &PerformanceMetrics,
     mut updates: impl FnMut(SyncUpdate),
 ) -> Result<SyncStats> {
+    let _reconciliation = performance.timer(Stage::Reconciliation);
     let mut stats = SyncStats::default();
 
     // Note the chain tip (virtual DAA ↔ wall clock) so exports can date events
@@ -74,7 +88,10 @@ pub async fn sync_once(
                 None => dag?.sink,
             };
             tracing::info!("fresh index, starting at {start}");
-            store.apply(&BlockEvents::empty(start), start)?;
+            {
+                let _commit = performance.timer(Stage::Commit);
+                store.apply(&BlockEvents::empty(start), start)?;
+            }
             start
         }
     };
@@ -83,7 +100,10 @@ pub async fn sync_once(
     if !step.removed.is_empty() {
         stats.reorged_out = step.removed.len() as u64;
         tracing::info!("reorg: rolling back {} chain blocks", step.removed.len());
-        store.rollback(&step.removed)?;
+        {
+            let _commit = performance.timer(Stage::Commit);
+            store.rollback(&step.removed)?;
+        }
         updates(SyncUpdate::Reorg {
             rolled_back: stats.reorged_out,
         });
@@ -110,7 +130,10 @@ pub async fn sync_once(
 
         let accepting = block?;
         last_daa = accepting.daa_score;
-        let (bodies, unresolved) = resolve_accepted_bodies(node, &accepted, &accepting).await?;
+        let (bodies, unresolved) = {
+            let _body_resolution = performance.timer(Stage::BodyResolution);
+            resolve_accepted_bodies(node, &accepted, &accepting).await?
+        };
         if unresolved > 0 {
             // Live sync at the tip must never skip acceptable data — a missing
             // body here is a flaky/lagging node, not pruned history (tip blocks
@@ -125,16 +148,19 @@ pub async fn sync_once(
         // Enumerate BEFORE the body filter so each index is the tx's position
         // in the node's accepted-tx list (acceptance = UTXO application
         // order); unresolved bodies hard-fail above, so none are skipped.
-        let block_events = classify(
-            store,
-            &accepted,
-            &accepting,
-            accepted
-                .accepted_tx_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(i, id)| bodies.get(id).map(|tx| (i as u32, tx))),
-        )?;
+        let block_events = {
+            let _classification = performance.timer(Stage::Classification);
+            classify(
+                store,
+                &accepted,
+                &accepting,
+                accepted
+                    .accepted_tx_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| bodies.get(id).map(|tx| (i as u32, tx))),
+            )?
+        };
 
         if !block_events.events.is_empty() {
             stats.events += block_events.events.len() as u64;
@@ -147,10 +173,16 @@ pub async fn sync_once(
                     tx_index: event.tx_index,
                 });
             }
-            store.apply(&block_events, accepted.accepting_block)?;
+            {
+                let _commit = performance.timer(Stage::Commit);
+                store.apply(&block_events, accepted.accepting_block)?;
+            }
             since_checkpoint = 0;
         } else if since_checkpoint >= CHECKPOINT_EVERY {
-            store.apply(&block_events, accepted.accepting_block)?;
+            {
+                let _commit = performance.timer(Stage::Commit);
+                store.apply(&block_events, accepted.accepting_block)?;
+            }
             since_checkpoint = 0;
         }
 
@@ -168,6 +200,7 @@ pub async fn sync_once(
         if let Some(cursor) = last_seen {
             let mut checkpoint = BlockEvents::empty(cursor);
             checkpoint.accepting_daa = last_daa;
+            let _commit = performance.timer(Stage::Commit);
             store.apply(&checkpoint, cursor)?;
         }
     }
