@@ -4,6 +4,12 @@ use super::*;
 /// initialized to boot time so a fresh instance gets the same 10-minute grace
 /// as a healthy one.
 pub(super) struct SyncHealth {
+    /// Most recent virtual-chain notification observed from the node.
+    pub(super) last_node_notification_ms: std::sync::atomic::AtomicI64,
+    /// Most recent reconciliation start, regardless of its trigger.
+    pub(super) last_reconciliation_start_ms: std::sync::atomic::AtomicI64,
+    /// Delay from the latest notification to its reconciliation start.
+    pub(super) notification_to_reconciliation_ms: std::sync::atomic::AtomicU64,
     /// The last successful sync pass.
     pub(super) last_sync_ok_ms: std::sync::atomic::AtomicI64,
     /// The last pass that MOVED processed_daa. Tracked separately because a
@@ -85,6 +91,9 @@ const TX_BACKFILL_BOOT_DELAY: std::time::Duration = std::time::Duration::from_se
 
 /// Limit optional token work so accepted-chain reconciliation keeps priority.
 const OPTIONAL_PROJECTION_CHUNK: u64 = 32;
+
+/// Cursor reconciliation safety net when the node notification path is quiet.
+const RECONCILIATION_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Follow a network's virtual chain forever, reconnecting on any failure.
 pub(super) async fn follow_forever(
@@ -185,94 +194,145 @@ pub(super) async fn follow_forever(
             ),
         }
         tracing::info!("{network}: following the chain");
-        loop {
-            let publication = performance.clone();
-            let publish = |deliveries: Vec<kascov_core::DeliveryRecord>, webhook: bool| {
-                let _publication =
-                    publication.timer(kascov_core::performance::Stage::Publication);
-                for record in deliveries {
-                    tracing::info!("{network}: committed covenant {} at {}", record.covenant_id, record.cursor);
-                    health.delivery_high_water.fetch_max(
-                        record.cursor.seq,
+        let mut schedule =
+            performance::ReconcileSchedule::new(node.wakeups(), RECONCILIATION_WATCHDOG);
+        'connected: loop {
+            let mut trigger = schedule.next().await;
+            if let performance::ReconcileTrigger::Disconnected { .. } = trigger {
+                break;
+            }
+            loop {
+                let reconcile_started = now_ms();
+                health.last_reconciliation_start_ms.store(
+                    reconcile_started as i64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let performance::ReconcileTrigger::Notification { observed_at_ms } = trigger {
+                    health
+                        .last_node_notification_ms
+                        .store(observed_at_ms as i64, std::sync::atomic::Ordering::Relaxed);
+                    health.notification_to_reconciliation_ms.store(
+                        reconcile_started.saturating_sub(observed_at_ms),
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    let record = std::sync::Arc::new(record);
-                    if delivery_tx.receiver_count() > 0 {
-                        let _ = delivery_tx.send(record.clone());
-                    }
-                    if webhook {
-                        let _ = hook_tx.try_send(HookEvent { delivery: record });
-                    }
                 }
-            };
-            let result = kascov_core::sync::sync_once_measured(
-                &node,
-                &mut store,
-                None,
-                &performance,
-                |update| match update {
-                    SyncUpdate::Committed(batch) => publish(batch.deliveries, true),
-                    SyncUpdate::Removed(batch) => publish(batch.deliveries, false),
-                    SyncUpdate::Reorg { rolled_back } => {
-                        tracing::info!("{network}: reorg — rolled back {rolled_back} chain blocks");
-                    }
-                    SyncUpdate::Progress(_) => {}
-                },
-            )
-            .await;
-            match result {
-                Ok(_) => {
-                    consecutive_errors = 0;
-                    let now = now_ms() as i64;
-                    health
-                        .last_sync_ok_ms
-                        .store(now, std::sync::atomic::Ordering::Relaxed);
-                    let verdict = progress.observe(
-                        store.processed_daa().ok().flatten(),
-                        store.tip().ok().flatten().map(|(daa, _)| daa),
-                    );
-                    if verdict.advanced {
-                        health
-                            .last_progress_ms
-                            .store(now, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if verdict.demand_recovery {
-                        tracing::warn!(
-                            "{network}: {} passes succeeded without moving the cursor while > {} DAA behind the tip — attempting recovery",
-                            kascov_core::sync::WEDGE_PASSES,
-                            kascov_core::sync::WEDGE_LAG_DAA
+
+                let publication = performance.clone();
+                let publish = |deliveries: Vec<kascov_core::DeliveryRecord>, webhook: bool| {
+                    let _publication =
+                        publication.timer(kascov_core::performance::Stage::Publication);
+                    for record in deliveries {
+                        tracing::info!(
+                            "{network}: committed covenant {} at {}",
+                            record.covenant_id,
+                            record.cursor
                         );
-                        if recover_wedged_cursor(&node, &mut store, network).await {
-                            continue;
+                        health
+                            .delivery_high_water
+                            .fetch_max(record.cursor.seq, std::sync::atomic::Ordering::Relaxed);
+                        let record = std::sync::Arc::new(record);
+                        if delivery_tx.receiver_count() > 0 {
+                            let _ = delivery_tx.send(record.clone());
+                        }
+                        if webhook {
+                            let _ = hook_tx.try_send(HookEvent { delivery: record });
                         }
                     }
-                    match store.drain_optional_projection_chunk(false, OPTIONAL_PROJECTION_CHUNK) {
-                        Ok(drain) if drain.processed > 0 => tracing::debug!(
-                            "{network}: projected {} delivery records; {} remain",
-                            drain.processed,
-                            drain.status.queued
+                };
+                let result = kascov_core::sync::sync_once_measured(
+                    &node,
+                    &mut store,
+                    None,
+                    &performance,
+                    |update| match update {
+                        SyncUpdate::Committed(batch) => publish(batch.deliveries, true),
+                        SyncUpdate::Removed(batch) => publish(batch.deliveries, false),
+                        SyncUpdate::Reorg { rolled_back } => tracing::info!(
+                            "{network}: reorg — rolled back {rolled_back} chain blocks"
                         ),
-                        Ok(_) => {}
-                        Err(err) => tracing::debug!(
-                            "{network}: optional token projection deferred after error ({err})"
-                        ),
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(err) => {
-                    consecutive_errors += 1;
-                    tracing::warn!(
-                        "{network}: sync interrupted ({err}), attempt {consecutive_errors}"
-                    );
-                    if consecutive_errors >= 3
-                        && recover_wedged_cursor(&node, &mut store, network).await
-                    {
+                        SyncUpdate::Progress(_) => {}
+                    },
+                )
+                .await;
+                match result {
+                    Ok(_) => {
                         consecutive_errors = 0;
-                        continue;
+                        let now = now_ms() as i64;
+                        health
+                            .last_sync_ok_ms
+                            .store(now, std::sync::atomic::Ordering::Relaxed);
+                        let verdict = progress.observe(
+                            store.processed_daa().ok().flatten(),
+                            store.tip().ok().flatten().map(|(daa, _)| daa),
+                        );
+                        if verdict.advanced {
+                            health
+                                .last_progress_ms
+                                .store(now, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if verdict.demand_recovery {
+                            tracing::warn!(
+                                "{network}: {} passes succeeded without moving the cursor while > {} DAA behind the tip — attempting recovery",
+                                kascov_core::sync::WEDGE_PASSES,
+                                kascov_core::sync::WEDGE_LAG_DAA
+                            );
+                            if recover_wedged_cursor(&node, &mut store, network).await {
+                                trigger = performance::ReconcileTrigger::Watchdog;
+                                continue;
+                            }
+                        }
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    break;
+                    Err(err) => {
+                        consecutive_errors += 1;
+                        tracing::warn!(
+                            "{network}: sync interrupted ({err}), attempt {consecutive_errors}"
+                        );
+                        if consecutive_errors >= 3
+                            && recover_wedged_cursor(&node, &mut store, network).await
+                        {
+                            consecutive_errors = 0;
+                            trigger = performance::ReconcileTrigger::Watchdog;
+                            continue;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        break 'connected;
+                    }
                 }
+
+                if let Some(pending) = schedule.take_pending() {
+                    if let performance::ReconcileTrigger::Disconnected { .. } = pending {
+                        break 'connected;
+                    }
+                    trigger = pending;
+                    continue;
+                }
+                let caught_up = match (store.cursor(), node.dag_info().await) {
+                    (Ok(Some(cursor)), Ok(dag)) => cursor == dag.sink,
+                    (_, Err(err)) => {
+                        tracing::debug!("{network}: could not confirm the latest node tip ({err})");
+                        true
+                    }
+                    _ => false,
+                };
+                if !caught_up {
+                    trigger = performance::ReconcileTrigger::Watchdog;
+                    continue;
+                }
+                break;
+            }
+
+            let accepted_pending = schedule.accepted_work_pending();
+            match store.drain_optional_projection_chunk(accepted_pending, OPTIONAL_PROJECTION_CHUNK)
+            {
+                Ok(drain) if drain.processed > 0 => tracing::debug!(
+                    "{network}: projected {} delivery records; {} remain",
+                    drain.processed,
+                    drain.status.queued
+                ),
+                Ok(_) => {}
+                Err(err) => tracing::debug!(
+                    "{network}: optional token projection deferred after error ({err})"
+                ),
             }
         }
     }

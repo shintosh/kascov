@@ -46,6 +46,17 @@ impl ChainWakeups {
         self.receiver.changed().await.ok()?;
         *self.receiver.borrow_and_update()
     }
+
+    pub fn try_recv(&mut self) -> Option<ChainWakeup> {
+        if !self.receiver.has_changed().unwrap_or(false) {
+            return None;
+        }
+        *self.receiver.borrow_and_update()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.receiver.has_changed().unwrap_or(false)
+    }
 }
 
 /// Read access to the chain, as the sync engine needs it. Implemented by the

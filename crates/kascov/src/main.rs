@@ -1766,6 +1766,9 @@ async fn serve(
         let pending_hub = PendingHub::new();
         let metrics = std::sync::Arc::new(kascov_core::performance::PerformanceMetrics::new());
         let health = std::sync::Arc::new(SyncHealth {
+            last_node_notification_ms: std::sync::atomic::AtomicI64::new(0),
+            last_reconciliation_start_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
+            notification_to_reconciliation_ms: std::sync::atomic::AtomicU64::new(0),
             last_sync_ok_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
             last_progress_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
             delivery_high_water: std::sync::atomic::AtomicU64::new(0),
@@ -2097,19 +2100,32 @@ async fn healthz_handler(
     let mut stalled = false;
     let mut networks = serde_json::Map::new();
     for &network in &state.networks {
-        let (last_ok, last_progress, delivery_high_water) = state
+        let (
+            last_notification,
+            last_reconciliation_start,
+            notification_delay,
+            last_ok,
+            last_progress,
+            delivery_high_water,
+        ) = state
             .sync_health
             .iter()
             .find(|(n, _)| *n == network)
             .map(|(_, h)| {
                 (
+                    h.last_node_notification_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    h.last_reconciliation_start_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    h.notification_to_reconciliation_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     h.last_sync_ok_ms.load(std::sync::atomic::Ordering::Relaxed),
                     h.last_progress_ms.load(std::sync::atomic::Ordering::Relaxed),
                     h.delivery_high_water.load(std::sync::atomic::Ordering::Relaxed),
 
                 )
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or((0, 0, 0, 0, 0, 0));
         let db = state.base_dir.join(format!("{network}.db"));
         // Nulls until the follower has created the DB; an open/read failure
         // degrades to the same nulls rather than failing the whole probe.
@@ -2159,6 +2175,9 @@ async fn healthz_handler(
                 "processed_daa": processed,
                 "tip_daa": tip,
                 "lag_daa": lag,
+                "last_node_notification_ms": last_notification,
+                "last_reconciliation_start_ms": last_reconciliation_start,
+                "notification_to_reconciliation_ms": notification_delay,
                 "last_sync_ok_ms": last_ok,
                 "last_progress_ms": last_progress,
                 "delivery_high_water": delivery_high_water,
