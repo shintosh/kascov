@@ -2216,6 +2216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kascov-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kascov-core"
 version = "0.1.0"
 dependencies = [
