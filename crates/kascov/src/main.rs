@@ -2130,7 +2130,10 @@ async fn serve(
                     axum::http::Method::POST,
                     axum::http::Method::OPTIONS,
                 ])
-                .allow_headers([axum::http::header::CONTENT_TYPE])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderName::from_static("last-event-id"),
+                ])
                 .max_age(std::time::Duration::from_secs(3600)),
         )
         .with_state(state);

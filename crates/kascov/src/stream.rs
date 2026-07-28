@@ -169,6 +169,69 @@ fn pending_sse_event(msg: &str) -> axum::response::sse::Event {
     axum::response::sse::Event::default().data(msg)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamStart {
+    Ready(kascov_core::StreamCursor),
+    Reset {
+        reason: &'static str,
+        current: kascov_core::StreamCursor,
+    },
+}
+
+fn select_stream_start(
+    headers: &axum::http::HeaderMap,
+    params: &std::collections::HashMap<String, String>,
+    info: kascov_core::store_delivery::DeliveryStreamInfo,
+) -> std::result::Result<StreamStart, &'static str> {
+    use kascov_core::store_delivery::DeliveryCursorPosition;
+
+    let raw = match headers.get("last-event-id") {
+        Some(value) => Some(
+            value
+                .to_str()
+                .map_err(|_| "Last-Event-ID must be an opaque <epoch>:<sequence> cursor")?,
+        ),
+        None => params.get("after").map(String::as_str),
+    };
+    let cursor = raw
+        .map(str::trim)
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| "Last-Event-ID or after must be an opaque <epoch>:<sequence> cursor")?
+        .unwrap_or(info.current);
+    Ok(match info.classify(cursor) {
+        DeliveryCursorPosition::Valid => StreamStart::Ready(cursor),
+        DeliveryCursorPosition::ForeignEpoch => StreamStart::Reset {
+            reason: "foreign_epoch",
+            current: info.current,
+        },
+        DeliveryCursorPosition::Ahead => StreamStart::Reset {
+            reason: "ahead",
+            current: info.current,
+        },
+    })
+}
+
+fn apply_stream_headers(response: &mut axum::response::Response) {
+    use axum::http::{header, HeaderName, HeaderValue};
+
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("last-event-id"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("identity"));
+}
+
 /// Push covenant events over SSE the moment the follower indexes them.
 /// Hints only — no replay, no backlog, lagged subscribers skip ahead;
 /// consumers confirm state through the polled feeds.
@@ -176,8 +239,9 @@ pub(super) async fn stream_handler(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<ServeState>>,
     axum::extract::Path(net_name): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+    use axum::http::StatusCode;
     use axum::response::sse::{Event, KeepAlive, Sse};
     use axum::response::IntoResponse;
     use std::sync::atomic::Ordering;
@@ -188,6 +252,26 @@ pub(super) async fn stream_handler(
     };
     let filter = match delivery_filter(&params) {
         Ok(filter) => filter,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let db = state.base_dir.join(format!("{network}.db"));
+    let info = match tokio::task::spawn_blocking(move || {
+        kascov_core::store::Store::open_read_only(&db, network)?.delivery_stream_info()
+    })
+    .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(error)) => {
+            tracing::error!("{network}: stream cursor discovery failed: {error}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "stream unavailable").into_response();
+        }
+        Err(error) => {
+            tracing::error!("{network}: stream cursor task failed: {error}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    let start = match select_stream_start(&headers, &params, info) {
+        Ok(start) => start,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let Some((_, delivery_hub)) = state.deliveries.iter().find(|(n, _)| *n == network) else {
@@ -212,6 +296,41 @@ pub(super) async fn stream_handler(
             .into_response();
     }
     let slot = SubscriberSlot(delivery_hub.subscribers.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+    if let StreamStart::Reset { reason, current } = start {
+        let reset = Event::default()
+            .retry(std::time::Duration::from_secs(1))
+            .event("reset")
+            .json_data(serde_json::json!({
+                "reason": reason,
+                "current_epoch": current.epoch,
+                "current": current,
+                "snapshot": format!("/data/{network}.json"),
+            }))
+            .expect("reset JSON is serializable");
+        let tail = futures::stream::unfold(slot, move |slot| async move {
+            tokio::time::sleep_until(deadline).await;
+            drop(slot);
+            None::<(
+                std::result::Result<Event, std::convert::Infallible>,
+                SubscriberSlot,
+            )>
+        });
+        let stream = futures::stream::once(async {
+            Ok::<_, std::convert::Infallible>(reset)
+        })
+        .chain(tail);
+        let mut response = Sse::new(stream)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(std::time::Duration::from_secs(25))
+                    .text("ka"),
+            )
+            .into_response();
+        apply_stream_headers(&mut response);
+        return response;
+    }
+    let StreamStart::Ready(after) = start else { unreachable!() };
     let delivery_rx = delivery_hub.tx.subscribe();
     let pending_rx = pending_hub.tx.subscribe();
 
@@ -221,7 +340,6 @@ pub(super) async fn stream_handler(
     // would otherwise pin a subscriber slot forever (keep-alives sink into
     // TCP buffers without erroring) — after the deadline the stream ends
     // cleanly and well-behaved clients (EventSource) reconnect on their own.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     let stream = futures::stream::unfold(
         (delivery_rx, pending_rx, slot, filter, performance),
         move |(mut delivery_rx, mut pending_rx, slot, filter, performance)| async move {
@@ -267,11 +385,18 @@ pub(super) async fn stream_handler(
             }
         },
     );
-    // Lead with a comment so headers and first bytes flush at accept time —
-    // clients see the connection is live and buffering proxies commit to the
-    // stream instead of holding a byteless response open.
-    let stream = futures::stream::once(async {
-        Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
+    // Lead with an ID-less ready frame. It flushes headers and reports the
+    // exact cursor selected by Last-Event-ID, the query, or current high-water.
+    let ready = Event::default()
+        .retry(std::time::Duration::from_secs(1))
+        .event("ready")
+        .json_data(serde_json::json!({
+            "after": after,
+            "current": info.current,
+        }))
+        .expect("ready JSON is serializable");
+    let stream = futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(ready)
     })
     .chain(stream);
 
@@ -282,18 +407,7 @@ pub(super) async fn stream_handler(
                 .text("ka"),
         )
         .into_response();
-    let headers = resp.headers_mut();
-    // no-store beats axum's default no-cache: the CDN must never coalesce a stream
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    // ask proxies not to buffer (nginx-style hint; Firebase may ignore it)
-    headers.insert(
-        HeaderName::from_static("x-accel-buffering"),
-        HeaderValue::from_static("no"),
-    );
+    apply_stream_headers(&mut resp);
     resp
 }
 
