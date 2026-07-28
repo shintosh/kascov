@@ -83,6 +83,9 @@ pub(super) async fn recover_wedged_cursor(
 /// boot; a completed backfill (the steady state) skips the wait entirely.
 const TX_BACKFILL_BOOT_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Limit optional token work so accepted-chain reconciliation keeps priority.
+const OPTIONAL_PROJECTION_CHUNK: u64 = 32;
+
 /// Follow a network's virtual chain forever, reconnecting on any failure.
 pub(super) async fn follow_forever(
     network: Network,
@@ -128,9 +131,8 @@ pub(super) async fn follow_forever(
             }
         };
         // One-shot per database + derivation version: build the KCC20 token
-        // accounting tables from history (then apply() keeps them current
-        // incrementally). Sited here, NOT in Store::open, so the serve path
-        // never pays it (WAL readers keep serving while it runs) — and
+        // accounting tables from history. Sited here, NOT in Store::open, so
+        // the serve path never pays it (WAL readers keep serving while it runs) — and
         // BEFORE the node connect, because it needs no node and must not
         // wait out an outage. The meta gate makes reruns O(1); a failure
         // retries next session.
@@ -243,6 +245,17 @@ pub(super) async fn follow_forever(
                         if recover_wedged_cursor(&node, &mut store, network).await {
                             continue;
                         }
+                    }
+                    match store.drain_optional_projection_chunk(false, OPTIONAL_PROJECTION_CHUNK) {
+                        Ok(drain) if drain.processed > 0 => tracing::debug!(
+                            "{network}: projected {} delivery records; {} remain",
+                            drain.processed,
+                            drain.status.queued
+                        ),
+                        Ok(_) => {}
+                        Err(err) => tracing::debug!(
+                            "{network}: optional token projection deferred after error ({err})"
+                        ),
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }

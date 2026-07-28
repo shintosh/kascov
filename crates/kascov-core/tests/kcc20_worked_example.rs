@@ -113,8 +113,10 @@ fn worked_example_replays_and_verifies() {
         store.apply_accepted_block(&block).unwrap();
     }
 
-    // The apply hook derived incrementally; the arithmetic must match the
-    // hand audit exactly.
+    let drain = store.drain_optional_projection_chunk(false, 256).unwrap();
+    assert_eq!(drain.status.lag, 0);
+
+    // The optional projection must match the hand audit exactly.
     let t = store.token_row(&cov).unwrap().expect("token derived");
     assert_eq!(
         t.validation, STATUS_VERIFIED,

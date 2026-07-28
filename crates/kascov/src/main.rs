@@ -4780,8 +4780,10 @@ async fn tokens_handler(
             .then(|| tokens.last().map(|(daa, id, _, _)| (*daa, id.clone())))
             .flatten();
         let derivation_version = store.token_derivation_version()?;
-        let pending =
-            derivation_version.as_deref() != Some(kascov_core::tokens::TOKEN_DERIVATION_VERSION);
+        let projection = store.optional_projection_status()?;
+        let pending = derivation_version.as_deref()
+            != Some(kascov_core::tokens::TOKEN_DERIVATION_VERSION)
+            || projection.lag > 0;
         let tip = store.tip()?;
         let mut out = serde_json::json!({
             "network": network.to_string(),
@@ -4797,6 +4799,9 @@ async fn tokens_handler(
                 "version": derivation_version,
                 "current": kascov_core::tokens::TOKEN_DERIVATION_VERSION,
                 "pending": pending,
+                "cursor": projection.cursor,
+                "delivery_high_water": projection.high_water,
+                "lag": projection.lag,
             },
         });
         if let Some((daa, id)) = next {
@@ -5070,6 +5075,7 @@ async fn token_handler(
             .collect();
         let checked = store.token_event_count(&token_id)?;
         let tip = store.tip()?;
+        let projection = store.optional_projection_status()?;
         let mut out = serde_json::json!({
             "network": network.to_string(),
             "generated_at_ms": now_ms(),
@@ -5101,6 +5107,10 @@ async fn token_handler(
                 "unresolved_cells": t.unresolved_cells,
                 "derivation_version": store.token_derivation_version()?,
                 "derived_at_daa": t.derived_at_daa,
+                "stale": projection.lag > 0,
+                "projection_cursor": projection.cursor,
+                "delivery_high_water": projection.high_water,
+                "projection_lag": projection.lag,
             },
         });
         if let Some(seq) = next_before_seq {

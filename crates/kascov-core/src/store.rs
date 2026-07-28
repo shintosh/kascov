@@ -1508,6 +1508,7 @@ impl Store {
                 ),
             });
         }
+        crate::projection::initialize(&store.conn)?;
         if delivery_migration {
             return Ok(store);
         }
@@ -2008,17 +2009,6 @@ impl Store {
         let stream_epoch = crate::store_delivery::transaction_stream_epoch(&tx)?;
         let mut next_stream_seq = crate::store_delivery::transaction_next_stream_seq(&tx)?;
         let first_stream_seq = (!block.events.is_empty()).then_some(next_stream_seq);
-        // Fresh KCC20 recognition observed in THIS block, per covenant:
-        // (token evidence, minter evidence). Hoisted from the write-time
-        // template stamps below so the token hook at the end of the
-        // transaction can gate on it with zero extra decodes.
-        let mut kcc20_seen: std::collections::HashMap<[u8; 32], (bool, bool)> =
-            std::collections::HashMap::new();
-        let mut note_kcc20 = |covenant_id: &CovenantId, template: &str| match template {
-            "KCC20 token" => kcc20_seen.entry(covenant_id.0).or_default().0 = true,
-            "KCC20 minter" => kcc20_seen.entry(covenant_id.0).or_default().1 = true,
-            _ => {}
-        };
         // Created rows must land BEFORE spends are marked: one accepting chain
         // block can sweep a whole intra-block chain (tx B spending tx A's
         // covenant output), and marking spends first would no-op against the
@@ -2027,11 +2017,9 @@ impl Store {
         for utxo in &block.created_utxos {
             // Recognition is stamped at write time ('' = no template matched)
             // so template analytics stay pure GROUP BYs at read time.
-            let template = registry()
-                .decode(utxo.spk_version, &utxo.spk_script)
-                .template
-                .unwrap_or("");
-            note_kcc20(&utxo.covenant_id, template);
+            let template =
+                registry().decode(utxo.spk_version, &utxo.spk_script).template.unwrap_or("");
+
             tx.execute(
                 "INSERT OR REPLACE INTO covenant_utxos
                  (txid, output_index, covenant_id, value, spk_version, spk_script,
@@ -2066,20 +2054,15 @@ impl Store {
             let mut kcc1_hash: Option<[u8; 32]> = None;
             let revealed: Option<String> = tx
                 .query_row(
-                    "SELECT spk_version, spk_script, covenant_id FROM covenant_utxos
+                    "SELECT spk_version, spk_script FROM covenant_utxos
                      WHERE txid = ?1 AND output_index = ?2",
                     params![outpoint.txid.0.as_slice(), outpoint.index],
-                    |r| {
-                        Ok((
-                            r.get::<_, u16>(0)?,
-                            r.get::<_, Vec<u8>>(1)?,
-                            r.get::<_, [u8; 32]>(2)?,
-                        ))
-                    },
+                    |r| Ok((r.get::<_, u16>(0)?, r.get::<_, Vec<u8>>(1)?)),
+
                 )
                 .optional()
                 .map_err(db_err)?
-                .map(|(version, spk, covenant_id)| {
+                .map(|(version, spk)| {
                     let redeem = kascov_decode::p2sh_reveal(&spk, sig);
                     kcc1_hash = redeem
                         .as_deref()
@@ -2099,7 +2082,6 @@ impl Store {
                             kascov_decode::kcc20::revealed_template(registry(), version, &redeem)
                         })
                         .unwrap_or("");
-                    note_kcc20(&CovenantId(covenant_id), template);
                     template.to_string()
                 });
             tx.execute(
@@ -2203,6 +2185,7 @@ impl Store {
                 applications,
             };
             crate::store_delivery::insert_delivery(&tx, &delivery)?;
+            crate::projection::enqueue(&tx, next_stream_seq, &[event.covenant_id])?;
             next_stream_seq = next_stream_seq.checked_add(1).ok_or_else(|| Error::Invalid {
                 what: "next stream sequence",
                 value: u64::MAX.to_string(),
@@ -2225,54 +2208,6 @@ impl Store {
                 [block.accepting_daa.to_string()],
             )
             .map_err(db_err)?;
-        }
-        // Resting-order upkeep — after the events land, because the
-        // resolved-DAA lookup in derive_resting_order reads THIS block's
-        // spend events. Spent covenants without a fresh order reveal only
-        // matter when a row already tracks them: one EXISTS probe each, so
-        // non-order blocks pay almost nothing.
-        for cov in &spent_covenants {
-            if order_covenants.contains(cov) {
-                continue;
-            }
-            let tracked: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM resting_orders WHERE covenant_id = ?1)",
-                    [cov.as_slice()],
-                    |r| r.get(0),
-                )
-                .map_err(db_err)?;
-            if tracked {
-                order_covenants.insert(*cov);
-            }
-        }
-        for cov in &order_covenants {
-            derive_resting_order(&tx, cov)?;
-        }
-        // Token accounting hook — same transaction, so readers can never see
-        // token tables inconsistent with covenant data (and after the
-        // processed_daa stamp, so derived_at_daa provenance names THIS
-        // block). Touched covenants are the events' covenants (classify()
-        // guarantees every created/spent covenant UTXO produces an event)
-        // plus fresh KCC20 recognition from the stamps above; the gate per
-        // covenant is two point lookups, so non-KCC20 blocks (the
-        // overwhelming majority) pay almost nothing.
-        {
-            let mut touched: std::collections::BTreeSet<[u8; 32]> =
-                block.events.iter().map(|e| e.covenant_id.0).collect();
-            touched.extend(kcc20_seen.keys().copied());
-            let mut tokens_todo: std::collections::BTreeSet<[u8; 32]> = Default::default();
-            let mut minters_todo: std::collections::BTreeSet<[u8; 32]> = Default::default();
-            for id in &touched {
-                let (token_ev, minter_ev) = kcc20_seen.get(id).copied().unwrap_or_default();
-                if token_ev || crate::tokens::is_token(&tx, id)? {
-                    tokens_todo.insert(*id);
-                }
-                if minter_ev || crate::tokens::is_minter(&tx, id)? {
-                    minters_todo.insert(*id);
-                }
-            }
-            crate::tokens::rederive_affected(&tx, &minters_todo, &tokens_todo)?;
         }
         if block.accepting_daa > 0 {
             crate::store_delivery::finish_canonical_batch(
@@ -2328,47 +2263,8 @@ impl Store {
         }
         let deliveries =
             crate::store_delivery::append_removed_deliveries(&tx, &canonical_removed)?;
-        // Token rewind, phase 1: capture the affected covenant set BEFORE the
-        // deletes below destroy the rows that carry the mapping. The
-        // spent_block term catches the un-reveal case (rolling back a spend
-        // deletes the reveal that proved a cell's state).
-        let mut affected: std::collections::BTreeSet<[u8; 32]> = Default::default();
-        for hash in &canonical_removed {
-            let hash = hash.0.as_slice();
-            for sql in [
-                "SELECT DISTINCT covenant_id FROM covenant_events WHERE accepting_block = ?1",
-                "SELECT DISTINCT covenant_id FROM covenant_utxos WHERE created_block = ?1",
-                "SELECT DISTINCT covenant_id FROM covenant_utxos WHERE spent_block = ?1",
-            ] {
-                let mut stmt = tx.prepare(sql).map_err(db_err)?;
-                let ids = stmt
-                    .query_map([hash], |r| r.get::<_, [u8; 32]>(0))
-                    .map_err(db_err)?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(db_err)?;
-                affected.extend(ids);
-            }
-        }
-        let mut tokens_todo: std::collections::BTreeSet<[u8; 32]> = Default::default();
-        let mut minters_todo: std::collections::BTreeSet<[u8; 32]> = Default::default();
-        for id in &affected {
-            if crate::tokens::is_token(&tx, id)? {
-                tokens_todo.insert(*id);
-            }
-            if crate::tokens::is_minter(&tx, id)? {
-                minters_todo.insert(*id);
-            }
-            // Belt and braces: any token whose derived events cite this
-            // covenant is re-derived too (tev_by_event).
-            let mut stmt = tx
-                .prepare("SELECT DISTINCT token_id FROM token_events WHERE covenant_id = ?1")
-                .map_err(db_err)?;
-            let ids = stmt
-                .query_map([id.as_slice()], |r| r.get::<_, [u8; 32]>(0))
-                .map_err(db_err)?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(db_err)?;
-            tokens_todo.extend(ids);
+        for delivery in &deliveries {
+            crate::projection::enqueue(&tx, delivery.cursor.seq, &[delivery.covenant_id])?;
         }
         crate::store_application::rollback_removed(&tx, &canonical_removed)?;
         for hash in &canonical_removed {
@@ -2399,31 +2295,8 @@ impl Store {
 
         }
         // Covenants whose genesis was rolled back disappear entirely.
-        tx.execute("DELETE FROM covenants WHERE event_count <= 0", [])
-            .map_err(db_err)?;
-        // Resting orders regress with their proofs: a rolled-back resolving
-        // spend reopens the order (its cell is live again), and a rolled-back
-        // recognizing reveal leaves nothing decodable, so the row is deleted.
-        // Gated on an existing row — a covenant that never proved an order
-        // has nothing to rewind.
-        for id in &affected {
-            let tracked: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM resting_orders WHERE covenant_id = ?1)",
-                    [id.as_slice()],
-                    |r| r.get(0),
-                )
-                .map_err(db_err)?;
-            if tracked {
-                derive_resting_order(&tx, id)?;
-            }
-        }
-        // Token rewind, phase 2: re-derive every affected token from the
-        // POST-rollback source tables — exactly what a from-scratch index at
-        // the rolled-back height would contain. Cells whose proving reveal
-        // was rolled back regress to unproven, verdicts regress with them,
-        // and a token whose entire evidence disappeared loses its rows.
-        crate::tokens::rederive_affected(&tx, &minters_todo, &tokens_todo)?;
+        tx.execute("DELETE FROM covenants WHERE event_count <= 0", []).map_err(db_err)?;
+
         // Record the reorg for the public feed. The best-available DAA is the
         // indexer's own progress mark (the tip we had reached) — the removed
         // blocks are being deleted, so their DAAs aren't reliably queryable

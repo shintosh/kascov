@@ -5,10 +5,9 @@
 //! Design contract (the conservative core of the feature):
 //!
 //! * One pure function, [`derive_token`], recomputes a token's entire derived
-//!   state from the two source tables. The write hook in `Store::apply_accepted_block`, the
-//!   reorg rewind in `Store::rollback_removed_blocks`, and the versioned boot pass
-//!   [`Store::derive_tokens_if_stale`] all call it — one truth, no
-//!   incremental delta-patcher that could drift (spend-time reveals
+//!   state from the two source tables. The optional projection worker and
+//!   [`Store::derive_tokens_if_stale`] call it — one truth, no incremental
+//!   delta-patcher that could drift (spend-time reveals
 //!   retro-resolve cells created by earlier events, so incremental code would
 //!   rewrite history rows anyway).
 //! * A token is `verified` ONLY when every event in its history classified
@@ -1531,7 +1530,7 @@ pub(crate) fn is_minter(conn: &Connection, id: &[u8; 32]) -> Result<bool> {
 }
 
 /// Tokens governed (pinned) by touched minters + touched tokens, re-derived
-/// in one deterministic pass. Shared by the apply hook and the reorg rewind.
+/// in one deterministic pass by the optional projection worker.
 pub(crate) fn rederive_affected(
     conn: &Connection,
     minters: &BTreeSet<[u8; 32]>,
@@ -2103,6 +2102,7 @@ mod tests {
         }
         fn apply(self, store: &mut Store) {
             store.apply_accepted_block(&self.block).unwrap();
+            store.drain_optional_projection_chunk(false, 256).unwrap();
         }
     }
 
@@ -2131,6 +2131,29 @@ mod tests {
     }
     fn holder(n: u8, amount: i64) -> St {
         (owner(n), 0x00, amt(amount), 0)
+    }
+
+    #[test]
+    fn canonical_apply_defers_token_derivation_until_projection_drain() {
+        let mut store = test_store("projection-deferred");
+        let genesis = minter_state(0);
+        let outputs = [minter_state(0), holder(0x20, 100)];
+        let first = BlockBuilder::new(1, 100)
+            .event(COV, EventKind::Genesis, TX_G)
+            .out(COV, TX_G, 0, &genesis);
+        store.apply_accepted_block(&first.block).unwrap();
+        let second = BlockBuilder::new(2, 200)
+            .event(COV, EventKind::Transition, TX_M)
+            .spend(TX_G, 0, TX_M, sig(&outputs, &genesis))
+            .out(COV, TX_M, 0, &outputs[0])
+            .out(COV, TX_M, 1, &outputs[1]);
+        store.apply_accepted_block(&second.block).unwrap();
+
+        assert!(row(&store, COV).is_none());
+        assert_eq!(2, store.optional_projection_status().unwrap().lag);
+        store.drain_optional_projection_chunk(false, 256).unwrap();
+        assert_eq!(STATUS_VERIFIED, row(&store, COV).unwrap().validation);
+        assert_eq!(0, store.optional_projection_status().unwrap().lag);
     }
     /// Covenant-owned balance (type 0x02): a launchpad curve's own inventory,
     /// or a locked pool after graduation. Not in anyone's hands.
@@ -2780,6 +2803,7 @@ mod tests {
         assert_eq!(row(&store, COV).unwrap().validation, STATUS_VERIFIED);
         // the reveal that proved everything reorgs out
         store.rollback_removed_blocks(&[BlockHash([2; 32])]).unwrap();
+        store.drain_optional_projection_chunk(false, 256).unwrap();
         assert!(row(&store, COV).is_none(), "unprovable token must not stay listed");
         assert_eq!(store.token_events_page(&CovenantId(COV), None, 10).unwrap().len(), 0);
 
@@ -2822,6 +2846,7 @@ mod tests {
         // rolling back the split deletes the reveal that proved M:1 — the
         // verdict must regress with it, not stay cached
         store.rollback_removed_blocks(&[BlockHash([3; 32])]).unwrap();
+        store.drain_optional_projection_chunk(false, 256).unwrap();
         let t = row(&store, COV).unwrap();
         assert_eq!(t.validation, STATUS_UNVALIDATED);
         assert_eq!(t.unresolved_cells, 2, "both mint outputs unproven again");
