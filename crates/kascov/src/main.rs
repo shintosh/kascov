@@ -157,6 +157,11 @@ enum Command {
     /// Re-verify every token and market program from scratch, ignoring the
     /// version gates, and record the pass in the verification log.
     Reverify,
+    /// Backfill the durable delivery log in bounded offline transactions.
+    MigrateDelivery {
+        #[arg(long, default_value_t = 1_000)]
+        batch_size: u64,
+    },
 }
 
 #[tokio::main]
@@ -277,6 +282,31 @@ it has never been spent, or the index has not walked the spend yet"
                 t1.as_secs_f64(),
                 (t0.elapsed() - t1).as_secs_f64()
             );
+            Ok(())
+        }
+        Command::MigrateDelivery { batch_size } => {
+            let path = db_path(&cli);
+            let mut store = Store::open_for_delivery_migration(&path, cli.network)?;
+            loop {
+                let progress = store.backfill_delivery_batch(batch_size)?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&progress)?);
+                } else {
+                    eprintln!(
+                        "{}: migrated {}, {} remaining",
+                        cli.network, progress.migrated, progress.remaining
+                    );
+                }
+                if progress.complete {
+                    if !cli.json {
+                        eprintln!(
+                            "{}: delivery history complete from DAA {} (ordering complete: {})",
+                            cli.network, progress.history_start_daa, progress.order_complete
+                        );
+                    }
+                    break;
+                }
+            }
             Ok(())
         }
     }

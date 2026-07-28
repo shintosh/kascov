@@ -1246,6 +1246,14 @@ impl Store {
                 ),
             });
         }
+        Self::open_writer(path, network, false)
+    }
+
+    pub fn open_for_delivery_migration(path: &Path, network: Network) -> Result<Self> {
+        Self::open_writer(path, network, true)
+    }
+
+    fn open_writer(path: &Path, network: Network, delivery_migration: bool) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Invalid {
                 what: "db path",
@@ -1486,6 +1494,22 @@ impl Store {
                     [stream_epoch.to_string()],
                 )
                 .map_err(db_err)?;
+        }
+        if !store.delivery_backfill_complete()? {
+            if delivery_migration {
+                return Ok(store);
+            }
+            return Err(Error::Invalid {
+                what: "delivery migration",
+                value: format!(
+                    "{} requires offline backfill; run kascov --network {network} --db {} migrate-delivery",
+                    path.display(),
+                    path.display()
+                ),
+            });
+        }
+        if delivery_migration {
+            return Ok(store);
         }
         // After the ownership check — a wrong-network database is never
         // mutated. Stale generic stamps are cleared before the backfills so

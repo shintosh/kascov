@@ -32,6 +32,15 @@ covenant_utxos(               -- every covenant-bound output ever seen
   template, revealed_template -- cached deterministic recognition
 )
 
+delivery_log(                 -- immutable accepted/removal history
+  stream_seq INTEGER PK, kind, source_stream_seq,
+  covenant_id, covenant_event_seq, txid,
+  accepting_block, accepting_daa, tx_index, event_index,
+  order_complete, pending_id, data_json
+)
+canonical_batches(accepting_block BLOB PK, accepting_daa,
+                  first_stream_seq, last_stream_seq)
+
 verified_sources(program_hash PK, program_hex, source, args, template, verified_at)
 webhook_subscriptions(id PK, covenant_id, kind, url, created_at)
 reorg_log(id PK, daa, at_ms, rolled_back)
@@ -83,7 +92,9 @@ The KCC20 tables are rebuildable projections:
 
 ## Transaction boundaries
 
-`Store::apply` is the atomic boundary for one accepting chain block. It updates events, cells, covenant summaries, and the cursor together. Rollback uses accepting-block indexes to:
+`Store::apply_accepted_block` atomically writes chain state, application state,
+durable delivery records, and the cursor. Rollback appends removal records in
+the same transaction. It uses accepting-block indexes to:
 
 1. unspend cells spent by removed blocks and clear `spent_sig`;
 2. delete cells created by removed blocks;
@@ -110,6 +121,18 @@ Gap recovery uses merge/finalize operations because it inserts history behind al
 - `NULL tx_index/time/blue_score` = predates capture or is beyond retained acceptance data.
 - `NULL token amount/supply` = not provable; never coerce to zero.
 - empty payload classification = inspected but no classification; `NULL` may mean no payload or pre-backfill.
+
+## Durable delivery migration
+
+Before a live writer opens an existing database, run `migrate-delivery` while
+the writer is stopped. The command takes the same writer lease. It backfills
+accepted records in bounded transactions. A restart resumes from rows without
+a delivery sequence. A completed rerun does no work.
+
+The migration does not invent historical removals. It records the retained
+accepted-history boundary and whether stored ordering metadata is complete.
+Public cursors use `<stream_epoch>:<stream_seq>`. Rollback never reuses a
+sequence.
 
 ## Why these shapes
 

@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 
 use crate::delivery::{DeliveryRecord, StreamCursor, StreamEpoch};
 use crate::store::Store;
@@ -220,6 +221,8 @@ pub(crate) fn canonical_deliveries_for_block(
                ON delivery_log.stream_seq BETWEEN canonical_batches.first_stream_seq
                                               AND canonical_batches.last_stream_seq
              WHERE canonical_batches.accepting_block = ?1
+               AND delivery_log.accepting_block = canonical_batches.accepting_block
+               AND delivery_log.kind = 'accepted'
              ORDER BY delivery_log.stream_seq",
         )
         .map_err(db_err)?;
@@ -259,11 +262,15 @@ pub(crate) fn append_removed_deliveries(
             let mut statement = tx
                 .prepare(
                     "SELECT data_json FROM delivery_log
-                     WHERE stream_seq BETWEEN ?1 AND ?2 ORDER BY stream_seq",
+                     WHERE stream_seq BETWEEN ?1 AND ?2
+                       AND accepting_block = ?3 AND kind = 'accepted'
+                     ORDER BY stream_seq",
                 )
                 .map_err(db_err)?;
             let records = statement
-                .query_map(params![first, last], |row| row.get::<_, String>(0))
+                .query_map(params![first, last, block.0.as_slice()], |row| {
+                    row.get::<_, String>(0)
+                })
                 .map_err(db_err)?
                 .map(|row| {
                     let json = row.map_err(db_err)?;
@@ -307,7 +314,168 @@ pub(crate) fn append_removed_deliveries(
     Ok(removals)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DeliveryMigrationProgress {
+    pub migrated: u64,
+    pub remaining: u64,
+    pub complete: bool,
+    pub history_start_daa: u64,
+    pub order_complete: bool,
+}
+
 impl Store {
+    pub fn backfill_delivery_batch(
+        &mut self,
+        batch_size: u64,
+    ) -> Result<DeliveryMigrationProgress> {
+        if self.delivery_backfill_complete()? {
+            return Ok(DeliveryMigrationProgress {
+                migrated: 0,
+                remaining: 0,
+                complete: true,
+                history_start_daa: self.delivery_history_start_daa()?,
+                order_complete: self.delivery_history_order_complete()?,
+            });
+        }
+        let tx = self.conn.transaction().map_err(db_err)?;
+        let limit = batch_size.clamp(1, 10_000);
+        let rows = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT covenant_id, seq, txid, accepting_block,
+                            accepting_daa, accepting_blue_score, tx_index,
+                            event_index
+                     FROM covenant_events
+                     WHERE delivery_stream_seq IS NULL
+                     ORDER BY accepting_blue_score, accepting_daa, tx_index,
+                              covenant_id, seq
+                     LIMIT ?1",
+                )
+                .map_err(db_err)?;
+            let rows = statement
+                .query_map([limit], |row| {
+                    Ok((
+                        crate::CovenantId(row.get(0)?),
+                        row.get::<_, u64>(1)?,
+                        crate::TxId(row.get(2)?),
+                        BlockHash(row.get(3)?),
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, Option<u64>>(5)?,
+                        row.get::<_, Option<u32>>(6)?,
+                        row.get::<_, Option<u32>>(7)?,
+                    ))
+                })
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
+        let epoch = transaction_stream_epoch(&tx)?;
+        let mut next_stream_seq = transaction_next_stream_seq(&tx)?;
+        for (covenant_id, covenant_event_seq, txid, accepting_block, accepting_daa, blue_score, tx_index, event_index) in &rows {
+            let record = DeliveryRecord {
+                cursor: StreamCursor { epoch, seq: next_stream_seq },
+                kind: crate::DeliveryKind::Accepted,
+                source_cursor: None,
+                covenant_id: *covenant_id,
+                covenant_event_seq: *covenant_event_seq,
+                txid: *txid,
+                accepting_block: *accepting_block,
+                accepting_daa: *accepting_daa,
+                tx_index: *tx_index,
+                event_index: *event_index,
+                order_complete: blue_score.is_some() && tx_index.is_some() && event_index.is_some(),
+                pending_id: None,
+                applications: vec![],
+            };
+            insert_delivery(&tx, &record)?;
+            tx.execute(
+                "UPDATE covenant_events SET delivery_stream_seq = ?1
+                 WHERE covenant_id = ?2 AND seq = ?3
+                   AND delivery_stream_seq IS NULL",
+                params![next_stream_seq, covenant_id.0.as_slice(), covenant_event_seq],
+            )
+            .map_err(db_err)?;
+            tx.execute(
+                "INSERT INTO canonical_batches (
+                    accepting_block, accepting_daa, first_stream_seq, last_stream_seq
+                 ) VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(accepting_block) DO UPDATE SET
+                    first_stream_seq = CASE
+                        WHEN canonical_batches.first_stream_seq IS NULL
+                          OR excluded.first_stream_seq < canonical_batches.first_stream_seq
+                        THEN excluded.first_stream_seq
+                        ELSE canonical_batches.first_stream_seq
+                    END,
+                    last_stream_seq = CASE
+                        WHEN canonical_batches.last_stream_seq IS NULL
+                          OR excluded.last_stream_seq > canonical_batches.last_stream_seq
+                        THEN excluded.last_stream_seq
+                        ELSE canonical_batches.last_stream_seq
+                    END",
+                params![accepting_block.0.as_slice(), accepting_daa, next_stream_seq],
+            )
+            .map_err(db_err)?;
+            next_stream_seq = next_stream_seq.checked_add(1).ok_or_else(|| Error::Invalid {
+                what: "next stream sequence",
+                value: u64::MAX.to_string(),
+            })?;
+        }
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'next_stream_seq'",
+            [next_stream_seq.to_string()],
+        )
+        .map_err(db_err)?;
+        let remaining = tx
+            .query_row(
+                "SELECT COUNT(*) FROM covenant_events WHERE delivery_stream_seq IS NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(db_err)?;
+        let history_start_daa = tx
+            .query_row("SELECT MIN(accepting_daa) FROM covenant_events", [], |row| {
+                row.get::<_, Option<u64>>(0)
+            })
+            .map_err(db_err)?
+            .unwrap_or(0);
+        let order_complete = if remaining == 0 {
+            tx.query_row(
+                "SELECT NOT EXISTS(
+                    SELECT 1 FROM covenant_events
+                    WHERE accepting_blue_score IS NULL OR tx_index IS NULL
+                       OR event_index IS NULL
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db_err)?
+        } else {
+            false
+        };
+        if remaining == 0 {
+            for (key, value) in [
+                ("delivery_backfill_complete", "1".to_owned()),
+                ("delivery_history_start_daa", history_start_daa.to_string()),
+                (
+                    "delivery_history_order_complete",
+                    if order_complete { "1" } else { "0" }.to_owned(),
+                ),
+            ] {
+                tx.execute("UPDATE meta SET value = ?1 WHERE key = ?2", params![value, key])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(DeliveryMigrationProgress {
+            migrated: rows.len() as u64,
+            remaining,
+            complete: remaining == 0,
+            history_start_daa,
+            order_complete,
+        })
+    }
+
     pub fn stream_epoch(&self) -> Result<StreamEpoch> {
         let raw = meta(&self.conn, "stream_epoch")?.ok_or_else(|| Error::Invalid {
             what: "stream epoch",
@@ -514,12 +682,13 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let first = Store::open(&path, Network::Testnet(10)).unwrap();
+        assert!(Store::open(&path, Network::Testnet(10)).is_err());
+        let first = Store::open_for_delivery_migration(&path, Network::Testnet(10)).unwrap();
         assert!(!first.delivery_backfill_complete().unwrap());
         let epoch = first.stream_epoch().unwrap();
         drop(first);
 
-        let second = Store::open(&path, Network::Testnet(10)).unwrap();
+        let second = Store::open_for_delivery_migration(&path, Network::Testnet(10)).unwrap();
         assert_eq!(epoch, second.stream_epoch().unwrap());
         assert!(!second.delivery_backfill_complete().unwrap());
         let marker: String = second
