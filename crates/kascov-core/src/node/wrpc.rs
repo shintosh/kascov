@@ -4,19 +4,25 @@
 use std::time::Duration;
 
 use kaspa_consensus_core::network::{NetworkId, NetworkType};
+use kaspa_notify::{connection::ChannelType, scope::VirtualChainChangedScope};
+use kaspa_rpc_core::api::ctl::RpcState;
 use kaspa_rpc_core::api::rpc::RpcApi;
-use kaspa_rpc_core::{RpcBlock, RpcHash, RpcTransaction};
+use kaspa_rpc_core::notify::connection::ChannelConnection;
+use kaspa_rpc_core::{Notification, RpcBlock, RpcHash, RpcTransaction};
 use kaspa_wrpc_client::{
     client::{ConnectOptions, ConnectStrategy},
     KaspaRpcClient, Resolver, WrpcEncoding,
 };
 
 use crate::model::*;
+use crate::node::{chain_wakeup_channel, ChainWakeupKind, ChainWakeups};
 use crate::{Error, Result};
 
 pub struct NodeHandle {
     client: KaspaRpcClient,
     network: Network,
+    wakeups: ChainWakeups,
+    wakeup_task: tokio::task::JoinHandle<()>,
 }
 
 impl NodeHandle {
@@ -44,7 +50,47 @@ impl NodeHandle {
             .await
             .map_err(|e| Error::Connect(e.to_string()))?;
 
-        let handle = Self { client, network };
+        let notification_channel = workflow_core::channel::Channel::<Notification>::unbounded();
+        let listener_id = client.register_new_listener(ChannelConnection::new(
+            "kascov-virtual-chain",
+            notification_channel.sender.clone(),
+            ChannelType::Persistent,
+        ));
+        client
+            .start_notify(listener_id, VirtualChainChangedScope::new(true).into())
+            .await
+            .map_err(rpc_err)?;
+        let control_channel = client.rpc_ctl().multiplexer().channel();
+        let notification_receiver = notification_channel.receiver.clone();
+        let (publisher, wakeups) = chain_wakeup_channel();
+        let wakeup_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    notification = notification_receiver.recv() => match notification {
+                        Ok(Notification::VirtualChainChanged(_)) => publisher.publish(
+                            ChainWakeupKind::VirtualChainChanged,
+                            observation_time_ms(),
+                        ),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    },
+                    state = control_channel.receiver.recv() => match state {
+                        Ok(RpcState::Disconnected) => {
+                            publisher.publish(ChainWakeupKind::Disconnected, observation_time_ms());
+                            break;
+                        }
+                        Ok(RpcState::Connected) => {}
+                        Err(_) => break,
+                    },
+                }
+            }
+        });
+        let handle = Self {
+            client,
+            network,
+            wakeups,
+            wakeup_task,
+        };
         let info = handle.server_info().await?;
         if info.network != network.to_string() {
             return Err(Error::NodeMismatch(format!(
@@ -57,6 +103,10 @@ impl NodeHandle {
 
     pub fn network(&self) -> Network {
         self.network
+    }
+
+    pub fn wakeups(&self) -> ChainWakeups {
+        self.wakeups.clone()
     }
 
     pub async fn server_info(&self) -> Result<ServerInfo> {
@@ -134,6 +184,19 @@ impl NodeHandle {
             .filter(|tx| tx.txid != TxId([0; 32]))
             .collect())
     }
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        self.wakeup_task.abort();
+    }
+}
+
+fn observation_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn rpc_err(e: kaspa_rpc_core::RpcError) -> Error {

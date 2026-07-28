@@ -24,6 +24,7 @@ hex = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
 fs2 = { workspace = true }
+workflow-core = { workspace = true }
 
 [dev-dependencies]
 # tests build p2sh commitments whose hash must match what p2sh_reveal checks
