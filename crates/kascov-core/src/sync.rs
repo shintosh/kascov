@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::model::*;
 use crate::node::ChainSource;
 use crate::performance::{PerformanceMetrics, Stage};
-use crate::store::{BlockEvents, EventKind, NewEvent, NewUtxo, Store};
+use crate::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent, NewUtxo, Store};
 use crate::Result;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,7 +52,25 @@ pub async fn sync_once(
     from: Option<BlockHash>,
     updates: impl FnMut(SyncUpdate),
 ) -> Result<SyncStats> {
-    sync_once_measured(node, store, from, &PerformanceMetrics::new(), updates).await
+    sync_once_with_decoder(node, store, from, &crate::NoApplicationDecoder, updates).await
+}
+
+pub async fn sync_once_with_decoder(
+    node: &impl ChainSource,
+    store: &mut Store,
+    from: Option<BlockHash>,
+    decoder: &(impl crate::ApplicationDecoder + ?Sized),
+    updates: impl FnMut(SyncUpdate),
+) -> Result<SyncStats> {
+    sync_once_measured_with_decoder(
+        node,
+        store,
+        from,
+        &PerformanceMetrics::new(),
+        decoder,
+        updates,
+    )
+    .await
 }
 
 /// Process one pass while recording bounded stage latency into the caller's
@@ -62,6 +80,25 @@ pub async fn sync_once_measured(
     store: &mut Store,
     from: Option<BlockHash>,
     performance: &PerformanceMetrics,
+    updates: impl FnMut(SyncUpdate),
+) -> Result<SyncStats> {
+    sync_once_measured_with_decoder(
+        node,
+        store,
+        from,
+        performance,
+        &crate::NoApplicationDecoder,
+        updates,
+    )
+    .await
+}
+
+pub async fn sync_once_measured_with_decoder(
+    node: &impl ChainSource,
+    store: &mut Store,
+    from: Option<BlockHash>,
+    performance: &PerformanceMetrics,
+    decoder: &(impl crate::ApplicationDecoder + ?Sized),
     mut updates: impl FnMut(SyncUpdate),
 ) -> Result<SyncStats> {
     let _reconciliation = performance.timer(Stage::Reconciliation);
@@ -90,7 +127,7 @@ pub async fn sync_once_measured(
             tracing::info!("fresh index, starting at {start}");
             {
                 let _commit = performance.timer(Stage::Commit);
-                store.apply(&BlockEvents::empty(start), start)?;
+                store.apply(&AcceptedBlockBatch::empty(start), start)?;
             }
             start
         }
@@ -154,6 +191,7 @@ pub async fn sync_once_measured(
                 store,
                 &accepted,
                 &accepting,
+                decoder,
                 accepted
                     .accepted_tx_ids
                     .iter()
@@ -198,7 +236,7 @@ pub async fn sync_once_measured(
     // hit the mid-stream checkpoint above.
     if since_checkpoint > 0 {
         if let Some(cursor) = last_seen {
-            let mut checkpoint = BlockEvents::empty(cursor);
+            let mut checkpoint = AcceptedBlockBatch::empty(cursor);
             checkpoint.accepting_daa = last_daa;
             let _commit = performance.timer(Stage::Commit);
             store.apply(&checkpoint, cursor)?;
@@ -367,7 +405,7 @@ pub async fn re_anchor(node: &impl ChainSource, store: &mut Store) -> Result<ReA
         // Cursor repoint carrying the anchor's own DAA (unlike reset_cursor's
         // bare repoint), so processed_daa is honest immediately instead of
         // overstating progress until the next completed pass.
-        let mut checkpoint = BlockEvents::empty(anchor);
+        let mut checkpoint = AcceptedBlockBatch::empty(anchor);
         checkpoint.accepting_daa = anchor_daa;
         store.apply(&checkpoint, anchor)?;
         return Ok(ReAnchor::Anchored(anchor));
@@ -787,6 +825,7 @@ pub async fn recover_gap(
                     store,
                     &accepted,
                     &accepting,
+                    &crate::NoApplicationDecoder,
                     accepted
                         .accepted_tx_ids
                         .iter()
@@ -885,8 +924,8 @@ fn reconcile_block(
     accepted: &AcceptedBlock,
     accepting: &Block,
     bodies: &HashMap<TxId, Transaction>,
-) -> Result<BlockEvents> {
-    let mut block_events = BlockEvents {
+) -> Result<AcceptedBlockBatch> {
+    let mut block_events = AcceptedBlockBatch {
         accepting_block: accepted.accepting_block,
         accepting_daa: accepting.daa_score,
         accepting_time_ms: accepting.timestamp_ms,
@@ -894,6 +933,7 @@ fn reconcile_block(
         events: vec![],
         created_utxos: vec![],
         spent_utxos: vec![],
+        transactions: vec![],
     };
     // No created_overlay here: every cell a reconcile-range tx could spend
     // already exists in the store — gap cells were merged by the capture
@@ -948,9 +988,10 @@ fn classify<'a>(
     store: &Store,
     accepted: &AcceptedBlock,
     accepting: &Block,
+    decoder: &(impl crate::ApplicationDecoder + ?Sized),
     txs: impl Iterator<Item = (u32, &'a Transaction)>,
-) -> Result<BlockEvents> {
-    let mut block_events = BlockEvents {
+) -> Result<AcceptedBlockBatch> {
+    let mut block_events = AcceptedBlockBatch {
         accepting_block: accepted.accepting_block,
         accepting_daa: accepting.daa_score,
         accepting_time_ms: accepting.timestamp_ms,
@@ -958,6 +999,7 @@ fn classify<'a>(
         events: vec![],
         created_utxos: vec![],
         spent_utxos: vec![],
+        transactions: vec![],
     };
     // Overlay for intra-block chains: a tx spending a covenant UTXO created by
     // an earlier tx in the same accepting block.
@@ -965,6 +1007,7 @@ fn classify<'a>(
     let mut known_overlay: HashSet<CovenantId> = HashSet::new();
 
     for (tx_index, tx) in txs {
+        block_events.transactions.push(AcceptedTransaction::prepare(tx, decoder));
         // covenant_id -> (spent utxos, created outputs)
         let mut touched: HashMap<CovenantId, (u32, u32)> = HashMap::new();
 
@@ -1178,8 +1221,8 @@ mod tests {
         }
     }
 
-    fn block_events(hash: BlockHash, daa: u64, events: Vec<NewEvent>) -> BlockEvents {
-        let mut block = BlockEvents::empty(hash);
+    fn block_events(hash: BlockHash, daa: u64, events: Vec<NewEvent>) -> AcceptedBlockBatch {
+        let mut block = AcceptedBlockBatch::empty(hash);
         block.accepting_daa = daa;
         block.events = events;
         block
@@ -1231,7 +1274,13 @@ mod tests {
             transactions: vec![],
         };
 
-        let events = classify(&store, &accepted, &accepting, [(7, &tx)].into_iter())
+        let events = classify(
+            &store,
+            &accepted,
+            &accepting,
+            &crate::NoApplicationDecoder,
+            [(7, &tx)].into_iter(),
+        )
             .unwrap()
             .events;
         assert_eq!(

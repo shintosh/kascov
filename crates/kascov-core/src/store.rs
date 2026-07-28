@@ -825,8 +825,8 @@ pub struct TxTokenActionRow {
     pub amount: Option<i64>,
 }
 
-/// Events produced while processing one accepting chain block, applied atomically.
-pub struct BlockEvents {
+/// Immutable facts prepared for one accepted block before SQLite begins a write.
+pub struct AcceptedBlockBatch {
     pub accepting_block: BlockHash,
     pub accepting_daa: u64,
     /// Accepting block header timestamp (ms) — real chain time for events.
@@ -839,9 +839,11 @@ pub struct BlockEvents {
     /// (outpoint, spending txid, spending input's signature script, budget,
     /// spending input's 0-based index — the KCC-1 leader/delegator ordering)
     pub spent_utxos: Vec<(Outpoint, TxId, Vec<u8>, u16, u32)>,
+    /// Accepted transactions in node order with all application decoding done.
+    pub transactions: Vec<AcceptedTransaction>,
 }
 
-impl BlockEvents {
+impl AcceptedBlockBatch {
     pub fn empty(accepting_block: BlockHash) -> Self {
         Self {
             accepting_block,
@@ -851,7 +853,23 @@ impl BlockEvents {
             events: vec![],
             created_utxos: vec![],
             spent_utxos: vec![],
+            transactions: vec![],
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedTransaction {
+    pub txid: TxId,
+    pub application: crate::ApplicationPreprocess,
+}
+
+impl AcceptedTransaction {
+    pub fn prepare(
+        tx: &crate::Transaction,
+        decoder: &(impl crate::ApplicationDecoder + ?Sized),
+    ) -> Self {
+        Self { txid: tx.txid, application: decoder.preprocess(tx) }
     }
 }
 
@@ -1580,7 +1598,7 @@ impl Store {
     /// recovery for testnet resets, where the stored cursor no longer exists
     /// on the node and sync would otherwise wedge forever.
     pub fn reset_cursor(&mut self, to: BlockHash) -> Result<()> {
-        self.apply(&BlockEvents::empty(to), to)
+        self.apply(&AcceptedBlockBatch::empty(to), to)
     }
 
     /// Write a consistent copy of the database (safe while a writer is active).
@@ -1889,7 +1907,17 @@ impl Store {
 
     /// Apply everything observed in one accepting chain block, atomically,
     /// and advance the cursor.
-    pub fn apply(&mut self, block: &BlockEvents, new_cursor: BlockHash) -> Result<()> {
+    pub fn apply(&mut self, block: &AcceptedBlockBatch, new_cursor: BlockHash) -> Result<()> {
+        // Payload parsing can be expensive. Complete it before SQLite holds
+        // the writer lock, then consume only owned results in the transaction.
+        let payload_classifications: Vec<_> = block
+            .events
+            .iter()
+            .map(|event| match &event.payload {
+                Some(payload) => (Some(payload_tag(payload)), Some(inscription_kind_of(payload))),
+                None => (None, None),
+            })
+            .collect();
         let tx = self.conn.transaction().map_err(db_err)?;
         // Fresh KCC20 recognition observed in THIS block, per covenant:
         // (token evidence, minter evidence). Hoisted from the write-time
@@ -2002,7 +2030,7 @@ impl Store {
             )
             .map_err(db_err)?;
         }
-        for event in &block.events {
+        for (event, (tag, kind)) in block.events.iter().zip(payload_classifications) {
             let is_genesis = event.kind == EventKind::Genesis;
             tx.execute(
                 "INSERT INTO covenants (covenant_id, genesis_txid, genesis_daa, lineage_complete)
@@ -2016,13 +2044,6 @@ impl Store {
                 ],
             )
             .map_err(db_err)?;
-            // Payload classification is stamped at write time (like the UTXO
-            // templates above) so the lanes/inscriptions analytics stay pure
-            // GROUP BYs at read time. NULL payload → NULL stamps.
-            let (tag, kind) = match &event.payload {
-                Some(p) => (Some(payload_tag(p)), Some(inscription_kind_of(p))),
-                None => (None, None),
-            };
             tx.execute(
                 "INSERT INTO covenant_events (covenant_id, seq, kind, txid, accepting_block, accepting_daa, payload, lane_namespace, payload_tag, inscription_kind, tx_index, accepting_time_ms, accepting_blue_score)
                  VALUES (?1,
@@ -2058,7 +2079,7 @@ impl Store {
         .map_err(db_err)?;
         // The indexer's own progress, distinct from the node tip: during a
         // backlog replay the tip races ahead while this advances block by
-        // block. Skipped when the batch carries no DAA (BlockEvents::empty
+        // block. Skipped when the batch carries no DAA (AcceptedBlockBatch::empty
         // from reset_cursor / the fresh-index bootstrap) — a cursor repoint
         // is not progress and must never stamp 0 over real progress.
         if block.accepting_daa > 0 {
@@ -2489,7 +2510,7 @@ impl Store {
     /// block, must change nothing), and event seqs are provisional appends —
     /// [`Store::finalize_gap_recovery`] re-sequences afterwards, so no token
     /// hook runs here either.
-    pub fn merge_recovered_block(&mut self, block: &BlockEvents) -> Result<MergeCounts> {
+    pub fn merge_recovered_block(&mut self, block: &AcceptedBlockBatch) -> Result<MergeCounts> {
         let mut counts = MergeCounts::default();
         let tx = self.conn.transaction().map_err(db_err)?;
         // Created cells land BEFORE spends are marked — same intra-block
@@ -6147,8 +6168,8 @@ mod tests {
         );
     }
 
-    fn block_with_events(hash: u8, daa: u64, events: Vec<(u8, EventKind, u8)>) -> BlockEvents {
-        BlockEvents {
+    fn block_with_events(hash: u8, daa: u64, events: Vec<(u8, EventKind, u8)>) -> AcceptedBlockBatch {
+        AcceptedBlockBatch {
             accepting_block: BlockHash([hash; 32]),
             accepting_daa: daa,
             accepting_time_ms: daa * 1000,
@@ -6168,6 +6189,7 @@ mod tests {
                 .collect(),
             created_utxos: vec![],
             spent_utxos: vec![],
+            transactions: vec![],
         }
     }
 
@@ -6415,7 +6437,7 @@ mod tests {
         // ids 0xA0.., 0xA1.., 0xA1(0xA1 everywhere), 0xB0..
         let mut id_a1_zero = [0u8; 32];
         id_a1_zero[0] = 0xa1;
-        let block = BlockEvents {
+        let block = AcceptedBlockBatch {
             accepting_block: BlockHash([9; 32]),
             accepting_daa: 100,
             accepting_time_ms: 100_000,
@@ -6459,6 +6481,7 @@ mod tests {
             ],
             created_utxos: vec![],
             spent_utxos: vec![],
+            transactions: vec![],
         };
         store.apply(&block, BlockHash([9; 32])).unwrap();
 
@@ -6513,7 +6536,7 @@ mod tests {
         let lane_ns = "01020304".to_string();
         let mut lane_payload = hex::decode(&lane_ns).unwrap();
         lane_payload.extend_from_slice(&[0u8; 16]);
-        let block = BlockEvents {
+        let block = AcceptedBlockBatch {
             accepting_block: BlockHash([9; 32]),
             accepting_daa: 100,
             accepting_time_ms: 100_000,
@@ -6542,6 +6565,7 @@ mod tests {
             ],
             created_utxos: vec![],
             spent_utxos: vec![],
+            transactions: vec![],
         };
         let mut store = store;
         store.apply(&block, BlockHash([9; 32])).unwrap();
@@ -6580,7 +6604,7 @@ mod tests {
 
         {
             let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
-            let block = BlockEvents {
+            let block = AcceptedBlockBatch {
                 accepting_block: BlockHash([1; 32]),
                 accepting_daa: 10,
                 accepting_time_ms: 10_000,
@@ -6594,6 +6618,7 @@ mod tests {
                     spk_script: spk,
                 }],
                 spent_utxos: vec![(outpoint, TxId([8; 32]), sig, 0, 0)],
+                transactions: vec![],
             };
             store.apply(&block, BlockHash([1; 32])).unwrap();
             // Write-time recognition names the real program immediately.
@@ -6636,7 +6661,7 @@ mod tests {
 
         {
             let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
-            let block = BlockEvents {
+            let block = AcceptedBlockBatch {
                 accepting_block: BlockHash([1; 32]),
                 accepting_daa: 10,
                 accepting_time_ms: 10_000,
@@ -6652,6 +6677,7 @@ mod tests {
                 }],
                 created_utxos: vec![],
                 spent_utxos: vec![],
+                transactions: vec![],
             };
             store.apply(&block, BlockHash([1; 32])).unwrap();
             assert_eq!(store.inscription_breakdown().unwrap(), want);
@@ -6688,7 +6714,7 @@ mod tests {
             payload,
             lane_namespace: lane,
         };
-        let block = BlockEvents {
+        let block = AcceptedBlockBatch {
             accepting_block: BlockHash([9; 32]),
             accepting_daa: 100,
             accepting_time_ms: 100_000,
@@ -6704,6 +6730,7 @@ mod tests {
             ],
             created_utxos: vec![],
             spent_utxos: vec![],
+            transactions: vec![],
         };
         let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
         store.apply(&block, BlockHash([9; 32])).unwrap();
@@ -6786,7 +6813,7 @@ mod tests {
         store.reset_cursor(BlockHash([9; 32])).unwrap();
         assert_eq!(store.processed_daa().unwrap(), Some(100));
         // an event-less checkpoint carrying a DAA still advances it
-        let mut checkpoint = BlockEvents::empty(BlockHash([2; 32]));
+        let mut checkpoint = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         checkpoint.accepting_daa = 250;
         store.apply(&checkpoint, BlockHash([2; 32])).unwrap();
         assert_eq!(store.processed_daa().unwrap(), Some(250));
@@ -6963,7 +6990,7 @@ mod tests {
             spk_script: script,
         };
 
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.created_utxos = vec![
             utxo(0x01, 0xA1, p2pk(&key_a)), // keyA state #1 (spent below)
@@ -6973,7 +7000,7 @@ mod tests {
         ];
         store.apply(&b1, BlockHash([1; 32])).unwrap();
 
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 200;
         b2.created_utxos = vec![utxo(0x04, 0xA1, p2pk(&key_a))]; // keyA state #2, live
         b2.spent_utxos = vec![
@@ -7047,7 +7074,7 @@ mod tests {
             spk_script: script,
         };
 
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.created_utxos = vec![
             utxo(0x01, 0xA1, p2pk),
@@ -7081,7 +7108,7 @@ mod tests {
         // spend the p2sh state, revealing its (template-less) program
         let mut sig = vec![0x03];
         sig.extend_from_slice(&redeem);
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 200;
         b2.spent_utxos = vec![(
             Outpoint {
@@ -7125,7 +7152,7 @@ mod tests {
         p2sh2.push(0x87);
         let mut sig2 = vec![redeem2.len() as u8];
         sig2.extend_from_slice(&redeem2);
-        let mut b3 = BlockEvents::empty(BlockHash([3; 32]));
+        let mut b3 = AcceptedBlockBatch::empty(BlockHash([3; 32]));
         b3.accepting_daa = 300;
         b3.created_utxos = vec![utxo(0x05, 0xC3, p2sh2)];
         b3.spent_utxos = vec![(
@@ -7171,7 +7198,7 @@ mod tests {
         };
         // 0xE5: two p2sh cells (0x01 spent below, 0x02 stays live);
         // 0xF6: one live p2sh cell, never revealed.
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.created_utxos = vec![
             utxo(0x01, 0xE5, p2sh(0x11)),
@@ -7179,7 +7206,7 @@ mod tests {
             utxo(0x03, 0xF6, p2sh(0x33)),
         ];
         store.apply(&b1, BlockHash([1; 32])).unwrap();
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 200;
         b2.spent_utxos = vec![(
             Outpoint {
@@ -7449,7 +7476,7 @@ mod tests {
             lane_namespace: lane.map(str::to_string),
         };
         // daa 100: two lane events (two covenants) + one foreign-lane event.
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.events = vec![
             ev(1, 1, Some(&ns)),
@@ -7458,12 +7485,12 @@ mod tests {
         ];
         store.apply(&b1, BlockHash([1; 32])).unwrap();
         // daa 150: same bucket (width 100) as 100.
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 150;
         b2.events = vec![ev(1, 4, Some(&ns))];
         store.apply(&b2, BlockHash([2; 32])).unwrap();
         // daa 250: next bucket. Also a non-lane event that must not count.
-        let mut b3 = BlockEvents::empty(BlockHash([3; 32]));
+        let mut b3 = AcceptedBlockBatch::empty(BlockHash([3; 32]));
         b3.accepting_daa = 250;
         b3.events = vec![ev(2, 5, Some(&ns)), ev(9, 6, None)];
         store.apply(&b3, BlockHash([3; 32])).unwrap();
@@ -7490,7 +7517,7 @@ mod tests {
             txid: TxId([0x10; 32]),
             index: 0,
         };
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.created_utxos = vec![NewUtxo {
             outpoint,
@@ -7504,7 +7531,7 @@ mod tests {
         let spender = TxId([0x20; 32]);
         assert!(store.spent_by_txid(&spender).unwrap().is_empty());
 
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 200;
         b2.spent_utxos = vec![(outpoint, spender, vec![0x01, 0x51], 60, 0)];
         store.apply(&b2, BlockHash([2; 32])).unwrap();
@@ -7531,7 +7558,7 @@ mod tests {
         let tx2 = TxId([0x02; 32]); // multi-covenant: transitions A, births B
         let tx3 = TxId([0x03; 32]); // mint event on B (token delta wired below)
 
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.events = vec![NewEvent {
             covenant_id: cov_a,
@@ -7554,7 +7581,7 @@ mod tests {
         }];
         store.apply(&b1, BlockHash([1; 32])).unwrap();
 
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 200;
         b2.events = vec![
             NewEvent {
@@ -7610,7 +7637,7 @@ mod tests {
         )];
         store.apply(&b2, BlockHash([2; 32])).unwrap();
 
-        let mut b3 = BlockEvents::empty(BlockHash([3; 32]));
+        let mut b3 = AcceptedBlockBatch::empty(BlockHash([3; 32]));
         b3.accepting_daa = 300;
         b3.events = vec![NewEvent {
             covenant_id: cov_b,
@@ -7834,11 +7861,11 @@ mod tests {
         };
         // Newer block applied first, and intra-block events inserted with
         // indices out of rowid order — the key alone must recover the order.
-        let mut newer = BlockEvents::empty(BlockHash([2; 32]));
+        let mut newer = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         newer.accepting_daa = 200;
         newer.events = vec![ev(0xC3, 0x30, 7)];
         store.apply(&newer, BlockHash([2; 32])).unwrap();
-        let mut older = BlockEvents::empty(BlockHash([1; 32]));
+        let mut older = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         older.accepting_daa = 100;
         older.events = vec![ev(0xA1, 0x10, 5), ev(0xB2, 0x20, 2)];
         store.apply(&older, BlockHash([1; 32])).unwrap();
@@ -7916,13 +7943,13 @@ mod tests {
         };
         // Two blocks share DAA 100 (tx_index collides across them → txid
         // breaks the tie); insertion order is deliberately not feed order.
-        let mut b1 = BlockEvents::empty(BlockHash([1; 32]));
+        let mut b1 = AcceptedBlockBatch::empty(BlockHash([1; 32]));
         b1.accepting_daa = 100;
         b1.events = vec![ev(0xA, 0x50, 0), ev(0xB, 0x10, 1), ev(0xA, 0x60, 2)];
-        let mut b2 = BlockEvents::empty(BlockHash([2; 32]));
+        let mut b2 = AcceptedBlockBatch::empty(BlockHash([2; 32]));
         b2.accepting_daa = 100;
         b2.events = vec![ev(0xC, 0x20, 0), ev(0xD, 0x70, 1)];
-        let mut b3 = BlockEvents::empty(BlockHash([3; 32]));
+        let mut b3 = AcceptedBlockBatch::empty(BlockHash([3; 32]));
         b3.accepting_daa = 105;
         // tx 0x40 moves two covenants at once: same txid, same tx_index.
         b3.events = vec![
@@ -7931,7 +7958,7 @@ mod tests {
             ev(0x9, 0x40, 1),
             ev(0xF, 0x80, 2),
         ];
-        let mut b4 = BlockEvents::empty(BlockHash([4; 32]));
+        let mut b4 = AcceptedBlockBatch::empty(BlockHash([4; 32]));
         b4.accepting_daa = 110;
         b4.events = vec![ev(0xB, 0x90, 0)];
         for b in [&b3, &b1, &b4, &b2] {

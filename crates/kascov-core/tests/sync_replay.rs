@@ -6,9 +6,11 @@ use std::sync::Mutex;
 
 use kascov_core::model::*;
 use kascov_core::node::{compute_covenant_id, ChainSource};
-use kascov_core::store::{EventKind, Store};
-use kascov_core::sync::{sync_once, SyncUpdate};
-use kascov_core::{Error, Result};
+use kascov_core::store::{AcceptedTransaction, EventKind, Store};
+use kascov_core::sync::{sync_once, sync_once_with_decoder, SyncUpdate};
+use kascov_core::{
+    ApplicationDecoder, ApplicationOutput, ApplicationPreprocess, DecodeFailure, Error, Result,
+};
 
 fn h(n: u8) -> BlockHash {
     BlockHash([n; 32])
@@ -120,6 +122,92 @@ fn accepted(block: BlockHash, txs: &[TxId]) -> AcceptedBlock {
         accepting_block: block,
         accepted_tx_ids: txs.to_vec(),
     }
+}
+
+struct MarkerDecoder;
+
+impl ApplicationDecoder for MarkerDecoder {
+    fn preprocess(&self, tx: &Transaction) -> ApplicationPreprocess {
+        match tx.payload.as_slice() {
+            b"valid" => ApplicationPreprocess {
+                raw_envelope: Some(tx.payload.clone()),
+                application_payload: Some(b"app".to_vec()),
+                outputs: vec![ApplicationOutput {
+                    output_index: 0,
+                    covenant_id: cov(7),
+                    application_id: "counter".into(),
+                    artifact_id: [8; 32],
+                    actor_path: "Counter".into(),
+                    state_json: "{}".into(),
+                }],
+                failures: vec![],
+            },
+            b"invalid" | b"oversized" => ApplicationPreprocess {
+                raw_envelope: Some(tx.payload.clone()),
+                failures: vec![DecodeFailure {
+                    output_index: None,
+                    application_id: None,
+                    artifact_id: None,
+                    code: if tx.payload == b"invalid" {
+                        "invalid"
+                    } else {
+                        "oversized"
+                    }
+                    .into(),
+                    detail: "bounded failure".into(),
+                }],
+                ..ApplicationPreprocess::default()
+            },
+            _ => ApplicationPreprocess::default(),
+        }
+    }
+}
+
+#[test]
+fn accepted_transactions_prepare_valid_invalid_absent_and_oversized_results() {
+    let transaction = |payload: &[u8]| Transaction {
+        txid: tx_id(payload.len() as u8),
+        version: 1,
+        inputs: vec![],
+        outputs: vec![],
+        payload: payload.to_vec(),
+    };
+
+    let valid = AcceptedTransaction::prepare(&transaction(b"valid"), &MarkerDecoder);
+    assert_eq!(valid.application.outputs.len(), 1);
+
+    let invalid = AcceptedTransaction::prepare(&transaction(b"invalid"), &MarkerDecoder);
+    assert_eq!(invalid.application.failures[0].code, "invalid");
+
+    let absent = AcceptedTransaction::prepare(&transaction(b"absent"), &MarkerDecoder);
+    assert_eq!(absent.application, ApplicationPreprocess::default());
+
+    let oversized = AcceptedTransaction::prepare(&transaction(b"oversized"), &MarkerDecoder);
+    assert_eq!(oversized.application.failures[0].code, "oversized");
+}
+
+#[tokio::test]
+async fn decoder_failure_preserves_raw_covenant_facts() {
+    let db = std::env::temp_dir().join(format!("kascov-decoder-failure-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    let mut store = Store::open(&db, Network::Testnet(10)).unwrap();
+    let funding = Outpoint { txid: tx_id(0x11), index: 0 };
+    let covenant_id = valid_genesis_id(funding);
+    let mut transaction = covenant_tx(tx_id(0x12), vec![funding], Some(covenant_id));
+    transaction.payload = b"invalid".to_vec();
+    let mut chain = FakeChain { blocks: HashMap::new(), steps: Mutex::new(vec![]), sink: h(0) };
+    chain.block(h(1), 100, vec![transaction]);
+    chain.steps.lock().unwrap().push(ChainStep {
+        removed: vec![],
+        added: vec![accepted(h(1), &[tx_id(0x12)])],
+    });
+
+    sync_once_with_decoder(&chain, &mut store, Some(h(0)), &MarkerDecoder, |_| {})
+        .await
+        .unwrap();
+
+    assert_eq!(store.events(&covenant_id).unwrap().len(), 1);
+    assert_eq!(store.utxos(&covenant_id, false).unwrap().len(), 1);
 }
 
 #[tokio::test]

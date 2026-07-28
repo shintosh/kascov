@@ -15,7 +15,7 @@
 //! prod TN10 index (2026-07-12 backup).
 
 use kascov_core::model::{BlockHash, CovenantId, Network, Outpoint, TxId};
-use kascov_core::store::{BlockEvents, EventKind, NewEvent, NewUtxo, Store};
+use kascov_core::store::{AcceptedBlockBatch, EventKind, NewEvent, NewUtxo, Store};
 use kascov_core::tokens::STATUS_VERIFIED;
 
 #[derive(serde::Deserialize)]
@@ -65,7 +65,7 @@ fn worked_example_replays_and_verifies() {
     // of the event's tx plus the spends that tx performed, exactly as the
     // live sync would have applied them.
     for ev in &fixture.events {
-        let mut block = BlockEvents::empty(BlockHash([ev.seq as u8 + 1; 32]));
+        let mut block = AcceptedBlockBatch::empty(BlockHash([ev.seq as u8 + 1; 32]));
         block.accepting_daa = ev.accepting_daa;
         block.accepting_time_ms = ev.accepting_daa * 100;
         block.accepting_blue_score = ev.accepting_daa;

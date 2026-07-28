@@ -1931,7 +1931,7 @@ pub(crate) fn token_minter_directory(conn: &Connection) -> Result<Vec<TokenMinte
 mod tests {
     use super::*;
     use crate::model::{BlockHash, Network, Outpoint, TxId};
-    use crate::store::{BlockEvents, EventKind, NewEvent, NewUtxo, Store};
+    use crate::store::{AcceptedBlockBatch, EventKind, NewEvent, NewUtxo, Store};
 
     /// A real on-chain KCC20 build (1568-byte reveal program) as the splice
     /// base — synthetic programs can't decode against the observed skeletons,
@@ -2015,12 +2015,12 @@ mod tests {
     }
 
     struct BlockBuilder {
-        block: BlockEvents,
+        block: AcceptedBlockBatch,
     }
 
     impl BlockBuilder {
         fn new(hash: u8, daa: u64) -> Self {
-            let mut block = BlockEvents::empty(BlockHash([hash; 32]));
+            let mut block = AcceptedBlockBatch::empty(BlockHash([hash; 32]));
             block.accepting_daa = daa;
             block.accepting_time_ms = daa * 1000;
             block.accepting_blue_score = daa;

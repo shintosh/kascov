@@ -9941,7 +9941,7 @@ mod search_tests {
 #[cfg(test)]
 mod galaxy_tests {
     use super::*;
-    use kascov_core::store::{BlockEvents, EventKind, NewEvent, NewUtxo, Store};
+    use kascov_core::store::{AcceptedBlockBatch, EventKind, NewEvent, NewUtxo, Store};
     use kascov_core::{BlockHash, CovenantId, Network, Outpoint, TxId};
 
     fn ev(cov: u8, kind: EventKind, tx: u8) -> NewEvent {
@@ -9973,7 +9973,7 @@ mod galaxy_tests {
             ev(0xF6, EventKind::Genesis, 0x30),
         ];
         events.extend(extra);
-        let block = BlockEvents {
+        let block = AcceptedBlockBatch {
             accepting_block: BlockHash([1; 32]),
             accepting_daa: 100,
             accepting_time_ms: 100_000,
@@ -9990,6 +9990,7 @@ mod galaxy_tests {
                 spk_script: vec![],
             }],
             spent_utxos: vec![],
+            transactions: vec![],
         };
         store.apply(&block, BlockHash([1; 32])).unwrap();
         store
@@ -10820,7 +10821,7 @@ mod consistency_tests {
 #[cfg(test)]
 mod feed_and_sitemap_tests {
     use super::*;
-    use kascov_core::store::{BlockEvents, EventKind, NewEvent, Store};
+    use kascov_core::store::{AcceptedBlockBatch, EventKind, NewEvent, Store};
     use kascov_core::{CovenantId, Outpoint};
 
     const ATOM: &str = "http://www.w3.org/2005/Atom";
@@ -10978,7 +10979,7 @@ mod feed_and_sitemap_tests {
         let path = std::env::temp_dir().join(format!("kascov-sitemap-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut store = Store::open(&path, Network::Mainnet).unwrap();
-        let block = BlockEvents {
+        let block = AcceptedBlockBatch {
             accepting_block: BlockHash([1; 32]),
             accepting_daa: 1_000,
             accepting_time_ms: 1_700_000_000_000,
@@ -10994,6 +10995,7 @@ mod feed_and_sitemap_tests {
             }],
             created_utxos: vec![],
             spent_utxos: vec![],
+            transactions: vec![],
         };
         store.apply(&block, BlockHash([1; 32])).unwrap();
         // Tip 1,000 DAA past the event: the coin's lastmod anchors 100s back.
@@ -11099,7 +11101,7 @@ mod feed_and_sitemap_tests {
                 lane_namespace: None,
             });
         }
-        let block = BlockEvents {
+        let block = AcceptedBlockBatch {
             accepting_block: BlockHash([1; 32]),
             accepting_daa: 1_000,
             accepting_time_ms: 1_700_000_000_000,
@@ -11122,6 +11124,7 @@ mod feed_and_sitemap_tests {
                 },
             }],
             spent_utxos: vec![],
+            transactions: vec![],
         };
         store.apply(&block, BlockHash([1; 32])).unwrap();
         store.set_tip(1_000, 1_700_000_000_000).unwrap();
