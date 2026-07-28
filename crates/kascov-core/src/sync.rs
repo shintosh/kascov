@@ -23,17 +23,10 @@ pub struct SyncStats {
 #[derive(Clone, Debug)]
 pub enum SyncUpdate {
     Progress(SyncStats),
-    Reorg {
-        rolled_back: u64,
-    },
-    Event {
-        covenant_id: CovenantId,
-        kind: EventKind,
-        txid: TxId,
-        accepting_daa: u64,
-        /// 0-based index in the accepting block's accepted-tx list.
-        tx_index: u32,
-    },
+    Reorg { rolled_back: u64 },
+    /// Accepted records returned only after their SQLite transaction commits.
+    Committed(crate::CommittedBatch),
+
 }
 
 /// How often the cursor advances through event-less chain blocks.
@@ -202,18 +195,12 @@ pub async fn sync_once_measured_with_decoder(
 
         if !block_events.events.is_empty() {
             stats.events += block_events.events.len() as u64;
-            for event in &block_events.events {
-                updates(SyncUpdate::Event {
-                    covenant_id: event.covenant_id,
-                    kind: event.kind,
-                    txid: event.txid,
-                    accepting_daa: block_events.accepting_daa,
-                    tx_index: event.tx_index,
-                });
-            }
-            {
+            let committed = {
                 let _commit = performance.timer(Stage::Commit);
-                store.apply_accepted_block(&block_events)?;
+                store.apply_accepted_block(&block_events)?
+            };
+            if !committed.deliveries.is_empty() {
+                updates(SyncUpdate::Committed(committed));
             }
             since_checkpoint = 0;
         } else if since_checkpoint >= CHECKPOINT_EVERY {

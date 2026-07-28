@@ -11,6 +11,8 @@ pub(super) struct SyncHealth {
     /// (some nodes answer it with an empty walk) — liveness alone would keep
     /// reporting ok while the index falls behind forever.
     pub(super) last_progress_ms: std::sync::atomic::AtomicI64,
+    /// Highest durable accepted delivery sequence published by this process.
+    pub(super) delivery_high_water: std::sync::atomic::AtomicU64,
 }
 
 /// After repeated sync failures — or passes that succeed without advancing —
@@ -86,7 +88,7 @@ pub(super) async fn follow_forever(
     network: Network,
     rpc: Option<String>,
     db: std::path::PathBuf,
-    live_tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    delivery_tx: tokio::sync::broadcast::Sender<std::sync::Arc<kascov_core::DeliveryRecord>>,
     hook_tx: tokio::sync::mpsc::Sender<HookEvent>,
     health: std::sync::Arc<SyncHealth>,
     performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
@@ -189,56 +191,26 @@ pub(super) async fn follow_forever(
                 None,
                 &performance,
                 |update| match update {
-                    SyncUpdate::Event {
-                        covenant_id,
-                        kind,
-                        txid,
-                        accepting_daa,
-                        tx_index,
-                    } => {
+                    SyncUpdate::Committed(batch) => {
                         let _publication =
                             publication.timer(kascov_core::performance::Stage::Publication);
-                        tracing::info!("{network}: {} covenant {covenant_id}", kind.as_str());
-                        // Fan out to any open SSE streams; serialization is skipped
-                        // entirely when nobody is listening, and send() failing
-                        // (zero receivers) is fine.
-                        if live_tx.receiver_count() > 0 {
-                            let msg = serde_json::json!({
-                                "covenant_id": covenant_id,
-                                "kind": kind.as_str(),
-                                "txid": txid,
-                                "accepting_daa": accepting_daa,
-                                "tx_index": tx_index,
-                            })
-                            .to_string();
-                            let _ = live_tx.send(msg.into());
+                        for record in batch.deliveries {
+                            tracing::info!("{network}: committed covenant {} at {}", record.covenant_id, record.cursor);
+                            health.delivery_high_water.fetch_max(
+                                record.cursor.seq,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            let record = std::sync::Arc::new(record);
+                            if delivery_tx.receiver_count() > 0 {
+                                let _ = delivery_tx.send(record.clone());
+                            }
+                            // Webhooks remain best-effort. Their source record
+                            // is nevertheless durable and post-commit.
+                            let _ = hook_tx.try_send(HookEvent { delivery: record });
                         }
-                        // Webhook queue: try_send so a slow/stalled delivery task
-                        // can never block the indexer — under backpressure (e.g.
-                        // the initial full sync) extra events are dropped, which
-                        // is fine: webhooks are hints, not a durable feed.
-                        let _ = hook_tx.try_send(HookEvent {
-                            covenant_id,
-                            kind: kind.as_str(),
-                            txid,
-                            accepting_daa,
-                            tx_index,
-                        });
                     }
                     SyncUpdate::Reorg { rolled_back } => {
-                        let _publication =
-                            publication.timer(kascov_core::performance::Stage::Publication);
                         tracing::info!("{network}: reorg — rolled back {rolled_back} chain blocks");
-                        // Same fire-and-forget fan-out as events; the "kind":"reorg"
-                        // tag lets subscribers distinguish it from covenant activity.
-                        if live_tx.receiver_count() > 0 {
-                            let msg = serde_json::json!({
-                                "kind": "reorg",
-                                "rolled_back": rolled_back,
-                            })
-                            .to_string();
-                            let _ = live_tx.send(msg.into());
-                        }
                     }
                     SyncUpdate::Progress(_) => {}
                 },

@@ -6,11 +6,12 @@ use std::sync::Mutex;
 
 use kascov_core::model::*;
 use kascov_core::node::{compute_covenant_id, ChainSource};
-use kascov_core::store::{AcceptedTransaction, EventKind, Store};
+use kascov_core::store::{AcceptedTransaction, Store};
 use kascov_core::sync::{sync_once, sync_once_with_decoder, SyncUpdate};
 use kascov_core::{
     ApplicationDecoder, ApplicationOutput, ApplicationPreprocess, DecodeFailure, Error, Result,
 };
+use rusqlite::Connection;
 
 fn h(n: u8) -> BlockHash {
     BlockHash([n; 32])
@@ -163,6 +164,44 @@ impl ApplicationDecoder for MarkerDecoder {
     }
 }
 
+#[tokio::test]
+async fn failed_accepted_commit_emits_no_committed_update() {
+    let dir = std::env::temp_dir().join(format!("kascov-sync-publication-failure-{}", std::process::id()));
+    let db = dir.join("failure.db");
+    let _ = std::fs::remove_file(&db);
+    let mut store = Store::open(&db, Network::Testnet(10)).unwrap();
+
+    let spend = Outpoint { txid: tx_id(0x01), index: 0 };
+    let covenant_id = valid_genesis_id(spend);
+    let transaction = covenant_tx(tx_id(0xA0), vec![spend], Some(covenant_id));
+    let mut chain = FakeChain { blocks: HashMap::new(), steps: Mutex::new(vec![]), sink: h(0) };
+    chain.block(h(1), 100, vec![transaction]);
+    chain.steps.lock().unwrap().push(ChainStep {
+        removed: vec![],
+        added: vec![accepted(h(1), &[tx_id(0xA0)])],
+    });
+
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_delivery BEFORE INSERT ON delivery_log
+             BEGIN SELECT RAISE(ABORT, 'test delivery failure'); END;",
+        )
+        .unwrap();
+
+    let mut committed = Vec::new();
+    let result = sync_once(&chain, &mut store, Some(h(0)), |update| {
+        if let SyncUpdate::Committed(batch) = update {
+            committed.push(batch);
+        }
+    })
+    .await;
+
+    assert!(result.is_err());
+    assert!(committed.is_empty(), "failed commits must not reach delivery consumers");
+    assert!(store.delivery_page(None, 10).unwrap().is_empty());
+}
+
 #[test]
 fn accepted_transactions_prepare_valid_invalid_absent_and_oversized_results() {
     let transaction = |payload: &[u8]| Transaction {
@@ -272,20 +311,16 @@ async fn genesis_transitions_burn_and_reorg() {
     // Pass 1: genesis + transition.
     let mut events = vec![];
     let stats = sync_once(&chain, &mut store, Some(h(0)), |u| {
-        if let SyncUpdate::Event {
-            kind, covenant_id, ..
-        } = u
-        {
-            events.push((kind, covenant_id));
+        if let SyncUpdate::Committed(batch) = u {
+            events.extend(batch.deliveries.into_iter().map(|record| record.covenant_id));
+
         }
     })
     .await
     .unwrap();
     assert_eq!(stats.events, 2);
-    assert_eq!(
-        events,
-        vec![(EventKind::Genesis, cov_x), (EventKind::Transition, cov_x)]
-    );
+    assert_eq!(events, vec![cov_x, cov_x]);
+
 
     let tip = store.tip().unwrap().expect("tip recorded on every pass");
     assert_eq!(tip.0, 0, "FakeChain reports virtual daa 0");

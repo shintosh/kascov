@@ -25,7 +25,7 @@ use kascov_core::{BlockHash, CovenantId, Network, TxId};
 
 use follower::{follow_forever, recover_wedged_cursor, SyncHealth};
 use pending::{pending_handler, poll_mempool_forever, PendingFeed};
-use stream::{stream_handler, LiveChannel};
+use stream::{stream_handler, DeliveryHub, PendingHub};
 
 #[derive(Parser)]
 #[command(
@@ -1058,26 +1058,14 @@ async fn sync_session(
                     println!("REORG      rolled back {rolled_back} chain blocks");
                 }
             }
-            SyncUpdate::Event {
-                covenant_id,
-                kind,
-                txid,
-                accepting_daa,
-                tx_index,
-            } => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "type": "event", "kind": kind, "covenant_id": covenant_id,
-                            "txid": txid, "accepting_daa": accepting_daa, "tx_index": tx_index,
-                        })
-                    );
-                } else {
-                    println!(
-                        "{:<10} {covenant_id}  tx {txid}  @ DAA {accepting_daa}",
-                        kind.as_str().to_uppercase()
-                    );
+            SyncUpdate::Committed(batch) => {
+                for record in batch.deliveries {
+                    if json {
+                        println!("{}", serde_json::json!({"type": "delivery", "delivery": record}));
+                    } else {
+                        println!("ACCEPTED   {}  tx {}  @ DAA {}  cursor {}", record.covenant_id, record.txid, record.accepting_daa, record.cursor);
+                    }
+
                 }
             }
         })
@@ -1491,9 +1479,11 @@ struct ServeState {
     /// Serializes custodial deploys: they all spend from one funding wallet, so
     /// concurrent builds would pick the same UTXO and double-spend. One in flight.
     deploy_inflight: tokio::sync::Mutex<()>,
-    /// Per-network live event broadcast (SSE). A Vec, not a HashMap:
+    /// Per-network committed delivery broadcast (SSE). A Vec, not a HashMap:
     /// `Network` has no `Hash` impl and there are at most a couple entries.
-    live: Vec<(Network, LiveChannel)>,
+    deliveries: Vec<(Network, DeliveryHub)>,
+    /// Per-network best-effort pending broadcast.
+    pending_hubs: Vec<(Network, PendingHub)>,
     /// Per-network live pending (mempool) feed — rows plus explicit poller
     /// health, snapshotted atomically by /pending and reported by /health.
     /// Same Vec-not-HashMap shape as `live`; there are only two networks.
@@ -1727,16 +1717,19 @@ async fn serve(
     let fresh = fresh_policy_from_env(std::env::var("KASCOV_FRESH_OK").ok().as_deref());
     probe_archives_at_boot(&base_dir, &networks, fresh)?;
 
-    let mut live = Vec::with_capacity(networks.len());
+    let mut deliveries = Vec::with_capacity(networks.len());
+    let mut pending_hubs = Vec::with_capacity(networks.len());
     let mut sync_health = Vec::with_capacity(networks.len());
     let mut pending = Vec::with_capacity(networks.len());
     let mut network_performance = Vec::with_capacity(networks.len());
     for &network in &networks {
-        let channel = LiveChannel::new();
+        let delivery_hub = DeliveryHub::new();
+        let pending_hub = PendingHub::new();
         let metrics = std::sync::Arc::new(kascov_core::performance::PerformanceMetrics::new());
         let health = std::sync::Arc::new(SyncHealth {
             last_sync_ok_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
             last_progress_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
+            delivery_high_water: std::sync::atomic::AtomicU64::new(0),
         });
         let db = base_dir.join(format!("{network}.db"));
         // The pending poller opens its OWN read-only handle on the same file,
@@ -1753,24 +1746,24 @@ async fn serve(
             network,
             cli.rpc.clone(),
             db,
-            channel.tx.clone(),
+            delivery_hub.tx.clone(),
             hook_tx,
             health.clone(),
             metrics.clone(),
         ));
         // Live pending (mempool) covenant feed: an additive, isolated poller
-        // that reads the same node the follower confirms against, keeps its
-        // own Store connection (never the follower's &mut), and fans pending
-        // events out on the SAME broadcast channel the confirmed events use.
+        // that reads the same node the follower confirms against and keeps its
+        // own Store connection (never the follower's &mut).
         let pending_set = std::sync::Arc::new(tokio::sync::Mutex::new(PendingFeed::new()));
         tokio::spawn(poll_mempool_forever(
             network,
             cli.rpc.clone(),
             db_for_poller,
-            channel.tx.clone(),
+            pending_hub.tx.clone(),
             pending_set.clone(),
         ));
-        live.push((network, channel));
+        deliveries.push((network, delivery_hub));
+        pending_hubs.push((network, pending_hub));
         sync_health.push((network, health));
         pending.push((network, pending_set));
         network_performance.push((network, metrics));
@@ -1790,7 +1783,8 @@ async fn serve(
         sync_health,
         performance: network_performance,
         deploy_inflight: tokio::sync::Mutex::new(()),
-        live,
+        deliveries,
+        pending_hubs,
         pending,
         consistency,
         cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -2064,24 +2058,25 @@ async fn healthz_handler(
     let mut stalled = false;
     let mut networks = serde_json::Map::new();
     for &network in &state.networks {
-        let (last_ok, last_progress) = state
+        let (last_ok, last_progress, delivery_high_water) = state
             .sync_health
             .iter()
             .find(|(n, _)| *n == network)
             .map(|(_, h)| {
                 (
                     h.last_sync_ok_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    h.last_progress_ms
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                    h.last_progress_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    h.delivery_high_water.load(std::sync::atomic::Ordering::Relaxed),
+
                 )
             })
-            .unwrap_or((0, 0));
+            .unwrap_or((0, 0, 0));
         let db = state.base_dir.join(format!("{network}.db"));
         // Nulls until the follower has created the DB; an open/read failure
         // degrades to the same nulls rather than failing the whole probe.
         let indexed = if db.exists() {
             tokio::task::spawn_blocking(move || -> Result<(Option<u64>, Option<u64>, bool)> {
-                let store = kascov_core::store::Store::open(&db, network)?;
+                let store = kascov_core::store::Store::open_read_only(&db, network)?;
                 Ok((
                     store.processed_daa()?,
                     store.tip()?.map(|t| t.0),
@@ -2127,6 +2122,7 @@ async fn healthz_handler(
                 "lag_daa": lag,
                 "last_sync_ok_ms": last_ok,
                 "last_progress_ms": last_progress,
+                "delivery_high_water": delivery_high_water,
                 "tx_index_backfill_done": backfill_done,
                 "mempool": mempool,
                 "performance": performance,
@@ -2164,13 +2160,9 @@ const HOOK_QUEUE: usize = 1024;
 /// Consecutive delivery failures before a subscription is deleted.
 const WEBHOOK_MAX_FAILURES: u32 = 10;
 
-/// One covenant event bound for webhook delivery.
+/// One durable, post-commit record bound for best-effort webhook delivery.
 struct HookEvent {
-    covenant_id: CovenantId,
-    kind: &'static str,
-    txid: TxId,
-    accepting_daa: u64,
-    tx_index: u32,
+    delivery: std::sync::Arc<kascov_core::DeliveryRecord>,
 }
 
 /// Is this IP off-limits for webhook POSTs? Loopback, RFC1918 private,
@@ -2332,7 +2324,7 @@ async fn webhook_delivery_forever(
         if stale {
             let db = db.clone();
             let any = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let store = Store::open(&db, network)?;
+                let store = Store::open_read_only(&db, network)?;
                 Ok(store.subscription_count()? > 0)
             })
             .await;
@@ -2341,28 +2333,35 @@ async fn webhook_delivery_forever(
         if !subs_probe.map(|(_, any)| any).unwrap_or(false) {
             continue;
         }
-        let subs = {
+        let matched = {
             let db = db.clone();
-            let cid = ev.covenant_id;
-            let kind = ev.kind;
-            tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String, Option<String>)>> {
-                let store = Store::open(&db, network)?;
-                Ok(store.subscriptions_matching(cid.0.as_slice(), kind)?)
+            let delivery = ev.delivery.clone();
+            tokio::task::spawn_blocking(move || -> Result<(String, Vec<(i64, String, Option<String>)>)> {
+                let store = Store::open_read_only(&db, network)?;
+                let kind = store
+                    .events_by_txid(&delivery.txid)?
+                    .into_iter()
+                    .find(|event| event.covenant_id == delivery.covenant_id && event.seq == delivery.covenant_event_seq)
+                    .map(|event| event.kind)
+                    .ok_or_else(|| anyhow::anyhow!("committed delivery {} has no canonical event", delivery.cursor))?;
+                let subscriptions = store.subscriptions_matching(delivery.covenant_id.0.as_slice(), &kind)?;
+                Ok((kind, subscriptions))
             })
             .await
         };
-        let Ok(Ok(subs)) = subs else { continue };
+        let Ok(Ok((event_kind, subs))) = matched else { continue };
         if subs.is_empty() {
             continue;
         }
         // Serialized once: every subscriber gets (and signs over) these bytes.
         let body = serde_json::json!({
             "network": network.to_string(),
-            "covenant_id": ev.covenant_id,
-            "kind": ev.kind,
-            "txid": ev.txid,
-            "accepting_daa": ev.accepting_daa,
-            "tx_index": ev.tx_index,
+            "cursor": ev.delivery.cursor,
+            "covenant_id": ev.delivery.covenant_id,
+            "kind": event_kind,
+            "txid": ev.delivery.txid,
+            "accepting_daa": ev.delivery.accepting_daa,
+            "tx_index": ev.delivery.tx_index,
         })
         .to_string();
         for (id, url, secret) in subs {

@@ -392,7 +392,7 @@ pub(super) async fn poll_mempool_forever(
     loop {
         // Our OWN Store connection — a concurrent WAL reader in this loop,
         // never the follower's &mut. Open failure is transient: retry.
-        let store = match Store::open(&db, network) {
+        let store = match Store::open_read_only(&db, network) {
             Ok(store) => store,
             Err(err) => {
                 pending.lock().await.mark_reconnecting();
