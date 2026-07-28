@@ -15,6 +15,7 @@ __pycache__/
 
 # Local agent settings and GitNexus-generated navigation stay private. Running
 # `npx gitnexus analyze` regenerates these files for whichever agent needs them.
+.harness/
 .claude/
 .gitnexus/
 AGENTS.md
