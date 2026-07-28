@@ -152,6 +152,12 @@ pub struct CommittedBatch {
     pub deliveries: Vec<DeliveryRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedRemovalBatch {
+    pub removed_blocks: Vec<BlockHash>,
+    pub deliveries: Vec<DeliveryRecord>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{StreamCursor, StreamEpoch};

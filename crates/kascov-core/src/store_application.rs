@@ -155,6 +155,30 @@ pub(crate) fn apply_accepted(
     Ok(())
 }
 
+pub(crate) fn rollback_removed(
+    tx: &rusqlite::Transaction<'_>,
+    removed: &[BlockHash],
+) -> Result<()> {
+    for block in removed {
+        let hash = block.0.as_slice();
+        tx.execute(
+            "UPDATE application_outputs SET spent_block = NULL WHERE spent_block = ?1",
+            [hash],
+        )
+        .map_err(db_err)?;
+        tx.execute("DELETE FROM application_outputs WHERE created_block = ?1", [hash])
+            .map_err(db_err)?;
+        tx.execute(
+            "DELETE FROM application_decode_failures WHERE accepting_block = ?1",
+            [hash],
+        )
+        .map_err(db_err)?;
+        tx.execute("DELETE FROM application_envelopes WHERE accepting_block = ?1", [hash])
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ApplicationHistoryRow {
     pub txid: TxId,

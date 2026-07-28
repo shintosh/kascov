@@ -208,14 +208,19 @@ pub(crate) fn finish_canonical_batch(
     Ok(())
 }
 
-pub(crate) fn deliveries_for_block(
+pub(crate) fn canonical_deliveries_for_block(
     conn: &Connection,
     accepting_block: &BlockHash,
 ) -> Result<Vec<DeliveryRecord>> {
     let mut statement = conn
         .prepare(
-            "SELECT data_json FROM delivery_log
-             WHERE accepting_block = ?1 ORDER BY stream_seq",
+            "SELECT delivery_log.data_json
+             FROM canonical_batches
+             JOIN delivery_log
+               ON delivery_log.stream_seq BETWEEN canonical_batches.first_stream_seq
+                                              AND canonical_batches.last_stream_seq
+             WHERE canonical_batches.accepting_block = ?1
+             ORDER BY delivery_log.stream_seq",
         )
         .map_err(db_err)?;
     let deliveries = statement
@@ -230,6 +235,76 @@ pub(crate) fn deliveries_for_block(
         })
         .collect();
     deliveries
+}
+
+pub(crate) fn append_removed_deliveries(
+    tx: &rusqlite::Transaction<'_>,
+    removed: &[BlockHash],
+) -> Result<Vec<DeliveryRecord>> {
+    let epoch = transaction_stream_epoch(tx)?;
+    let mut next_stream_seq = transaction_next_stream_seq(tx)?;
+    let mut removals = Vec::new();
+    for block in removed {
+        let bounds = tx
+            .query_row(
+                "SELECT first_stream_seq, last_stream_seq
+                 FROM canonical_batches WHERE accepting_block = ?1",
+                [block.0.as_slice()],
+                |row| Ok((row.get::<_, Option<u64>>(0)?, row.get::<_, Option<u64>>(1)?)),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some((Some(first), Some(last))) = bounds else { continue };
+        let sources = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT data_json FROM delivery_log
+                     WHERE stream_seq BETWEEN ?1 AND ?2 ORDER BY stream_seq",
+                )
+                .map_err(db_err)?;
+            let records = statement
+                .query_map(params![first, last], |row| row.get::<_, String>(0))
+                .map_err(db_err)?
+                .map(|row| {
+                    let json = row.map_err(db_err)?;
+                    serde_json::from_str::<DeliveryRecord>(&json).map_err(|error| Error::Invalid {
+                        what: "delivery record",
+                        value: error.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            records
+        };
+        for source in sources {
+            let removal = DeliveryRecord {
+                cursor: StreamCursor { epoch, seq: next_stream_seq },
+                kind: crate::DeliveryKind::Removed,
+                source_cursor: Some(source.cursor),
+                covenant_id: source.covenant_id,
+                covenant_event_seq: source.covenant_event_seq,
+                txid: source.txid,
+                accepting_block: source.accepting_block,
+                accepting_daa: source.accepting_daa,
+                tx_index: source.tx_index,
+                event_index: source.event_index,
+                order_complete: source.order_complete,
+                pending_id: source.pending_id,
+                applications: source.applications,
+            };
+            insert_delivery(tx, &removal)?;
+            removals.push(removal);
+            next_stream_seq = next_stream_seq.checked_add(1).ok_or_else(|| Error::Invalid {
+                what: "next stream sequence",
+                value: u64::MAX.to_string(),
+            })?;
+        }
+    }
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'next_stream_seq'",
+        [next_stream_seq.to_string()],
+    )
+    .map_err(db_err)?;
+    Ok(removals)
 }
 
 impl Store {
@@ -565,6 +640,127 @@ mod tests {
 
         let second = store.apply_accepted_block(&accepted_batch(2, 10)).unwrap();
         assert_eq!(2, second.deliveries[0].cursor.seq);
+    }
+
+    #[test]
+    fn accepted_removed_reaccepted_is_monotonic_and_rewinds_application_state() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-removed-delivery-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let first = accepted_batch(1, 9);
+        let mut second = accepted_batch(2, 10);
+        second.spent_utxos.push((
+            Outpoint { txid: TxId([9; 32]), index: 0 },
+            TxId([10; 32]),
+            vec![],
+            0,
+            0,
+        ));
+        second.transactions[0].application.outputs[0].state_json = "{\"value\":2}".into();
+
+        let accepted_first = store.apply_accepted_block(&first).unwrap();
+        let accepted_second = store.apply_accepted_block(&second).unwrap();
+        assert_eq!(1, accepted_first.deliveries[0].cursor.seq);
+        assert_eq!(2, accepted_second.deliveries[0].cursor.seq);
+        assert_eq!(
+            "{\"value\":2}",
+            store
+                .current_application_output("counter", "Counter", &CovenantId([1; 32]))
+                .unwrap()
+                .unwrap()
+                .state_json
+        );
+
+        let removed = store
+            .rollback_removed_blocks(&[BlockHash([2; 32]), BlockHash([2; 32])])
+            .unwrap();
+        assert_eq!(vec![BlockHash([2; 32])], removed.removed_blocks);
+        assert_eq!(1, removed.deliveries.len());
+        assert_eq!(DeliveryKind::Removed, removed.deliveries[0].kind);
+        assert_eq!(3, removed.deliveries[0].cursor.seq);
+        assert_eq!(Some(accepted_second.deliveries[0].cursor), removed.deliveries[0].source_cursor);
+        assert_eq!(
+            "{}",
+            store
+                .current_application_output("counter", "Counter", &CovenantId([1; 32]))
+                .unwrap()
+                .unwrap()
+                .state_json
+        );
+
+        let repeated = store
+            .rollback_removed_blocks(&[BlockHash([2; 32])])
+            .unwrap();
+        assert!(repeated.removed_blocks.is_empty());
+        assert!(repeated.deliveries.is_empty());
+        assert_eq!(3, store.delivery_high_water().unwrap().seq);
+
+        let reaccepted = store.apply_accepted_block(&second).unwrap();
+        assert_eq!(1, reaccepted.deliveries.len());
+        assert_eq!(DeliveryKind::Accepted, reaccepted.deliveries[0].kind);
+        assert_eq!(4, reaccepted.deliveries[0].cursor.seq);
+        assert_eq!(
+            vec![
+                DeliveryKind::Accepted,
+                DeliveryKind::Accepted,
+                DeliveryKind::Removed,
+                DeliveryKind::Accepted,
+            ],
+            store
+                .delivery_page(None, 10)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn removal_insert_failure_preserves_canonical_and_application_state() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-removal-failure-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let first = accepted_batch(1, 9);
+        let mut second = accepted_batch(2, 10);
+        second.spent_utxos.push((
+            Outpoint { txid: TxId([9; 32]), index: 0 },
+            TxId([10; 32]),
+            vec![],
+            0,
+            0,
+        ));
+        second.transactions[0].application.outputs[0].state_json = "{\"value\":2}".into();
+        store.apply_accepted_block(&first).unwrap();
+        let accepted = store.apply_accepted_block(&second).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_removal BEFORE INSERT ON delivery_log
+                 WHEN NEW.kind = 'removed'
+                 BEGIN SELECT RAISE(ABORT, 'test removal failure'); END;",
+            )
+            .unwrap();
+
+        assert!(store
+            .rollback_removed_blocks(&[BlockHash([2; 32])])
+            .is_err());
+        assert_eq!(2, store.delivery_high_water().unwrap().seq);
+        assert_eq!(2, store.delivery_page(None, 10).unwrap().len());
+        assert_eq!(accepted, store.apply_accepted_block(&second).unwrap());
+        assert_eq!(
+            "{\"value\":2}",
+            store
+                .current_application_output("counter", "Counter", &CovenantId([1; 32]))
+                .unwrap()
+                .unwrap()
+                .state_json
+        );
     }
 
     #[test]

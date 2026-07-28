@@ -185,30 +185,32 @@ pub(super) async fn follow_forever(
         tracing::info!("{network}: following the chain");
         loop {
             let publication = performance.clone();
+            let publish = |deliveries: Vec<kascov_core::DeliveryRecord>, webhook: bool| {
+                let _publication =
+                    publication.timer(kascov_core::performance::Stage::Publication);
+                for record in deliveries {
+                    tracing::info!("{network}: committed covenant {} at {}", record.covenant_id, record.cursor);
+                    health.delivery_high_water.fetch_max(
+                        record.cursor.seq,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let record = std::sync::Arc::new(record);
+                    if delivery_tx.receiver_count() > 0 {
+                        let _ = delivery_tx.send(record.clone());
+                    }
+                    if webhook {
+                        let _ = hook_tx.try_send(HookEvent { delivery: record });
+                    }
+                }
+            };
             let result = kascov_core::sync::sync_once_measured(
                 &node,
                 &mut store,
                 None,
                 &performance,
                 |update| match update {
-                    SyncUpdate::Committed(batch) => {
-                        let _publication =
-                            publication.timer(kascov_core::performance::Stage::Publication);
-                        for record in batch.deliveries {
-                            tracing::info!("{network}: committed covenant {} at {}", record.covenant_id, record.cursor);
-                            health.delivery_high_water.fetch_max(
-                                record.cursor.seq,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            let record = std::sync::Arc::new(record);
-                            if delivery_tx.receiver_count() > 0 {
-                                let _ = delivery_tx.send(record.clone());
-                            }
-                            // Webhooks remain best-effort. Their source record
-                            // is nevertheless durable and post-commit.
-                            let _ = hook_tx.try_send(HookEvent { delivery: record });
-                        }
-                    }
+                    SyncUpdate::Committed(batch) => publish(batch.deliveries, true),
+                    SyncUpdate::Removed(batch) => publish(batch.deliveries, false),
                     SyncUpdate::Reorg { rolled_back } => {
                         tracing::info!("{network}: reorg — rolled back {rolled_back} chain blocks");
                     }

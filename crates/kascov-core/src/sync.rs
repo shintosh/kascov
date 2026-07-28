@@ -26,6 +26,8 @@ pub enum SyncUpdate {
     Reorg { rolled_back: u64 },
     /// Accepted records returned only after their SQLite transaction commits.
     Committed(crate::CommittedBatch),
+    /// Removal records returned only after their rollback transaction commits.
+    Removed(crate::CommittedRemovalBatch),
 
 }
 
@@ -132,7 +134,10 @@ pub async fn sync_once_measured_with_decoder(
         tracing::info!("reorg: rolling back {} chain blocks", step.removed.len());
         {
             let _commit = performance.timer(Stage::Commit);
-            store.rollback(&step.removed)?;
+            let removed = store.rollback_removed_blocks(&step.removed)?;
+            if !removed.deliveries.is_empty() {
+                updates(SyncUpdate::Removed(removed));
+            }
         }
         updates(SyncUpdate::Reorg {
             rolled_back: stats.reorged_out,
@@ -344,7 +349,7 @@ pub enum ReAnchor {
 /// (the newest few, then samples spread through the whole indexed range),
 /// and the first one the node can walk from becomes the new cursor.
 /// Everything indexed above it lived on the abandoned side and goes through
-/// the same [`Store::rollback`] a witnessed reorg would get, including its
+/// the same [`Store::rollback_removed_blocks`] a witnessed reorg would get, including its
 /// reorg_log entry.
 ///
 /// Walkability is judged lag-aware: while the store is far behind the tip, a
@@ -387,7 +392,7 @@ pub async fn re_anchor(node: &impl ChainSource, store: &mut Store) -> Result<ReA
                 "re-anchor: rolling back {} accepting blocks above DAA {anchor_daa}",
                 above.len()
             );
-            store.rollback(&above)?;
+            store.rollback_removed_blocks(&above)?;
         }
         // Cursor repoint carrying the anchor's own DAA (unlike reset_cursor's
         // bare repoint), so processed_daa is honest immediately instead of

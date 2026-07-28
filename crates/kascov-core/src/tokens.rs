@@ -6,7 +6,7 @@
 //!
 //! * One pure function, [`derive_token`], recomputes a token's entire derived
 //!   state from the two source tables. The write hook in `Store::apply_accepted_block`, the
-//!   reorg rewind in `Store::rollback`, and the versioned boot pass
+//!   reorg rewind in `Store::rollback_removed_blocks`, and the versioned boot pass
 //!   [`Store::derive_tokens_if_stale`] all call it — one truth, no
 //!   incremental delta-patcher that could drift (spend-time reveals
 //!   retro-resolve cells created by earlier events, so incremental code would
@@ -2725,7 +2725,8 @@ mod tests {
         apply_happy_path(&mut reorged);
         // roll back the split AND the mint (blocks 3 and 2, tip first)
         reorged
-            .rollback(&[BlockHash([3; 32]), BlockHash([2; 32])])
+            .rollback_removed_blocks(&[BlockHash([3; 32]), BlockHash([2; 32])])
+
             .unwrap();
         // replacement branch: a different mint (250 to holder 0x50)
         let g0 = minter_state(0);
@@ -2778,18 +2779,10 @@ mod tests {
             .apply(&mut store);
         assert_eq!(row(&store, COV).unwrap().validation, STATUS_VERIFIED);
         // the reveal that proved everything reorgs out
-        store.rollback(&[BlockHash([2; 32])]).unwrap();
-        assert!(
-            row(&store, COV).is_none(),
-            "unprovable token must not stay listed"
-        );
-        assert_eq!(
-            store
-                .token_events_page(&CovenantId(COV), None, 10)
-                .unwrap()
-                .len(),
-            0
-        );
+        store.rollback_removed_blocks(&[BlockHash([2; 32])]).unwrap();
+        assert!(row(&store, COV).is_none(), "unprovable token must not stay listed");
+        assert_eq!(store.token_events_page(&CovenantId(COV), None, 10).unwrap().len(), 0);
+
         assert_eq!(store.token_balances(&CovenantId(COV), 10).unwrap().len(), 0);
     }
 
@@ -2828,7 +2821,7 @@ mod tests {
         assert_eq!(t.unresolved_cells, 1);
         // rolling back the split deletes the reveal that proved M:1 — the
         // verdict must regress with it, not stay cached
-        store.rollback(&[BlockHash([3; 32])]).unwrap();
+        store.rollback_removed_blocks(&[BlockHash([3; 32])]).unwrap();
         let t = row(&store, COV).unwrap();
         assert_eq!(t.validation, STATUS_UNVALIDATED);
         assert_eq!(t.unresolved_cells, 2, "both mint outputs unproven again");

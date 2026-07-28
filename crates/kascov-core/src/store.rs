@@ -1971,7 +1971,7 @@ impl Store {
             crate::store_delivery::canonical_batch_daa(&tx, &block.accepting_block)?
         {
             tx.commit().map_err(db_err)?;
-            let deliveries = crate::store_delivery::deliveries_for_block(
+            let deliveries = crate::store_delivery::canonical_deliveries_for_block(
                 &self.conn,
                 &block.accepting_block,
             )?;
@@ -2261,7 +2261,7 @@ impl Store {
             )?;
         }
         tx.commit().map_err(db_err)?;
-        let deliveries = crate::store_delivery::deliveries_for_block(
+        let deliveries = crate::store_delivery::canonical_deliveries_for_block(
             &self.conn,
             &block.accepting_block,
         )?;
@@ -2273,14 +2273,43 @@ impl Store {
     }
 
     /// Undo everything attributed to the given (reorged-out) chain blocks.
-    pub fn rollback(&mut self, removed: &[BlockHash]) -> Result<()> {
+    pub fn rollback_removed_blocks(
+        &mut self,
+        removed: &[BlockHash],
+    ) -> Result<crate::CommittedRemovalBatch> {
         let tx = self.conn.transaction().map_err(db_err)?;
+        let mut canonical_removed = Vec::with_capacity(removed.len());
+        let mut seen = std::collections::HashSet::with_capacity(removed.len());
+        for block in removed {
+            if !seen.insert(*block) {
+                continue;
+            }
+            let exists = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM canonical_batches WHERE accepting_block = ?1)",
+                    [block.0.as_slice()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(db_err)?;
+            if exists {
+                canonical_removed.push(*block);
+            }
+        }
+        if canonical_removed.is_empty() {
+            tx.commit().map_err(db_err)?;
+            return Ok(crate::CommittedRemovalBatch {
+                removed_blocks: vec![],
+                deliveries: vec![],
+            });
+        }
+        let deliveries =
+            crate::store_delivery::append_removed_deliveries(&tx, &canonical_removed)?;
         // Token rewind, phase 1: capture the affected covenant set BEFORE the
         // deletes below destroy the rows that carry the mapping. The
         // spent_block term catches the un-reveal case (rolling back a spend
         // deletes the reveal that proved a cell's state).
         let mut affected: std::collections::BTreeSet<[u8; 32]> = Default::default();
-        for hash in removed {
+        for hash in &canonical_removed {
             let hash = hash.0.as_slice();
             for sql in [
                 "SELECT DISTINCT covenant_id FROM covenant_events WHERE accepting_block = ?1",
@@ -2317,7 +2346,8 @@ impl Store {
                 .map_err(db_err)?;
             tokens_todo.extend(ids);
         }
-        for hash in removed {
+        crate::store_application::rollback_removed(&tx, &canonical_removed)?;
+        for hash in &canonical_removed {
             let hash = hash.0.as_slice();
             // revealed_template goes back to NULL (not ''): with spent_sig
             // NULL the reveal-todo index predicate no longer matches, so the
@@ -2339,11 +2369,10 @@ impl Store {
                 [hash],
             )
             .map_err(db_err)?;
-            tx.execute(
-                "DELETE FROM covenant_events WHERE accepting_block = ?1",
-                [hash],
-            )
-            .map_err(db_err)?;
+            tx.execute("DELETE FROM covenant_events WHERE accepting_block = ?1", [hash]).map_err(db_err)?;
+            tx.execute("DELETE FROM canonical_batches WHERE accepting_block = ?1", [hash])
+                .map_err(db_err)?;
+
         }
         // Covenants whose genesis was rolled back disappear entirely.
         tx.execute("DELETE FROM covenants WHERE event_count <= 0", [])
@@ -2375,7 +2404,7 @@ impl Store {
         // indexer's own progress mark (the tip we had reached) — the removed
         // blocks are being deleted, so their DAAs aren't reliably queryable
         // here, and not every reorged block carried covenant activity anyway.
-        if !removed.is_empty() {
+        if !canonical_removed.is_empty() {
             let daa: u64 = tx
                 .query_row(
                     "SELECT value FROM meta WHERE key = 'processed_daa'",
@@ -2388,11 +2417,15 @@ impl Store {
                 .unwrap_or(0);
             tx.execute(
                 "INSERT INTO reorg_log (daa, at_ms, rolled_back) VALUES (?1, ?2, ?3)",
-                params![daa, now_ms(), removed.len() as u64],
+                params![daa, now_ms(), canonical_removed.len() as u64],
             )
             .map_err(db_err)?;
         }
-        tx.commit().map_err(db_err)
+        tx.commit().map_err(db_err)?;
+        Ok(crate::CommittedRemovalBatch {
+            removed_blocks: canonical_removed,
+            deliveries,
+        })
     }
 
     /// The newest accepting chain blocks in the index as (block, DAA), newest
@@ -2900,7 +2933,8 @@ impl Store {
         // only tokens whose covenant rows changed (or whose derived rows cite
         // changed covenants — their (covenant_id, seq) references just went
         // stale under the renumber) can differ. That is exactly the closure
-        // apply()'s hook and rollback() already trust for correctness. A
+        // apply_accepted_block() and rollback_removed_blocks() already trust
+        // these source tables for correctness. A
         // version bump would rebuild EVERY token on EVERY database (mainnet
         // included) at next boot, for a repair scoped to one testnet window.
         {

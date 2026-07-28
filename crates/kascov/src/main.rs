@@ -1068,6 +1068,15 @@ async fn sync_session(
 
                 }
             }
+            SyncUpdate::Removed(batch) => {
+                for record in batch.deliveries {
+                    if json {
+                        println!("{}", serde_json::json!({"type": "delivery", "delivery": record}));
+                    } else {
+                        println!("REMOVED    {}  tx {}  @ DAA {}  cursor {}", record.covenant_id, record.txid, record.accepting_daa, record.cursor);
+                    }
+                }
+            }
         })
         .await?;
         if !follow {

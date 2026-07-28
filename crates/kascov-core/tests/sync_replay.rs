@@ -360,8 +360,21 @@ async fn genesis_transitions_burn_and_reorg() {
         removed: vec![h(3)],
         added: vec![accepted(h(4), &[])],
     });
-    let stats = sync_once(&chain, &mut store, None, |_| {}).await.unwrap();
+    let mut removals = vec![];
+    let stats = sync_once(&chain, &mut store, None, |update| {
+        if let SyncUpdate::Removed(batch) = update {
+            removals.extend(batch.deliveries);
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(stats.reorged_out, 1);
+    assert_eq!(1, removals.len());
+    assert_eq!(kascov_core::DeliveryKind::Removed, removals[0].kind);
+    assert_eq!(4, removals[0].cursor.seq);
+    assert_eq!(Some(kascov_core::StreamCursor { epoch: removals[0].cursor.epoch, seq: 3 }), removals[0].source_cursor);
+    let repeated = store.rollback_removed_blocks(&[h(3)]).unwrap();
+    assert!(repeated.deliveries.is_empty(), "a repeated rollback must not allocate another removal");
     let summary = store.summary(&cov_x).unwrap().unwrap();
     assert_eq!(summary.event_count, 2, "burn event must be rolled back");
     assert_eq!(
@@ -381,11 +394,18 @@ async fn genesis_transitions_burn_and_reorg() {
 
     // Pass 4: the burn is re-accepted in chain block 5 — index converges.
     chain.block(h(5), 302, vec![burn_tx]);
-    chain.steps.lock().unwrap().push(ChainStep {
-        removed: vec![],
-        added: vec![accepted(h(5), &[tx_id(0xD0)])],
-    });
-    sync_once(&chain, &mut store, None, |_| {}).await.unwrap();
+    chain.steps.lock().unwrap().push(ChainStep { removed: vec![], added: vec![accepted(h(5), &[tx_id(0xD0)])] });
+    let mut reaccepted = vec![];
+    sync_once(&chain, &mut store, None, |update| {
+        if let SyncUpdate::Committed(batch) = update {
+            reaccepted.extend(batch.deliveries);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(1, reaccepted.len());
+    assert_eq!(5, reaccepted[0].cursor.seq);
+
     let summary = store.summary(&cov_x).unwrap().unwrap();
     assert_eq!(summary.event_count, 3);
     assert_eq!(summary.live_utxos, 0);
