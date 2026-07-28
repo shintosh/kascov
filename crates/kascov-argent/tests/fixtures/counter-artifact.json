@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "id": "976dca39752a8bafeb238b59118cf90dc1d950900c3aa642bad7257c112207f3",
+  "generator": { "name": "argentc", "version": "0.1.0" },
+  "app": "CounterApp",
+  "dependencies": [],
+  "root": "/private/tmp/kascov-argentc.fHnd4Y/counter.ag",
+  "modules": ["/private/tmp/kascov-argentc.fHnd4Y/counter.ag"],
+  "argent": {
+    "templates": [{ "id": "template/counter", "actor": "Counter", "symbol": "gen__counter_template" }],
+    "template_plan": {
+      "templates": [{
+        "id": "template/counter",
+        "actor": "Counter",
+        "contract": "Counter",
+        "symbol": "gen__counter_template",
+        "sil_template_hash": "b6dcd7d97abc86da83cfa20668734d35369012c206d6cca3964fceaa694d895f",
+        "actor_type_handle": {
+          "state": "CounterState",
+          "context_fields": [],
+          "template": {
+            "prefix_hex": "",
+            "suffix_hex": "b9cb519c697652799358cd01087c7eb976c976013c9459937cbc7eaa02000001aa7e01207e7c7e01877eb900ccc38769757551",
+            "hash_hex": "b6dcd7d97abc86da83cfa20668734d35369012c206d6cca3964fceaa694d895f"
+          }
+        }
+      }],
+      "runtime_states": [],
+      "route_tables": [],
+      "route_proofs": [],
+      "route_families": [],
+      "witness_recipes": []
+    },
+    "interfaces": {
+      "exports": [{
+        "id": "interface/actor/Counter",
+        "app": "CounterApp",
+        "actor": "Counter",
+        "state": "CounterState",
+        "fingerprint_hex": "f5f884b7af15e7af7a5524e9b394b3727e82753098f9a8209f4d7425c62b478e"
+      }],
+      "imports": []
+    },
+    "states": [{ "name": "CounterState", "fields": [{ "name": "count", "type": { "kind": "int" } }] }],
+    "actor_enums": [],
+    "actors": [{
+      "name": "Counter",
+      "state": "CounterState",
+      "abi": { "actor": "Counter" },
+      "entries": [{
+        "name": "bump",
+        "kind": "leader",
+        "abi": { "actor": "Counter", "entry": "bump" },
+        "route_plan": {
+          "active_input": { "name": "self", "actor": "Counter", "cov_index": 0 },
+          "leader_input": { "name": "self", "actor": "Counter", "cov_index": 0 },
+          "consumes": [],
+          "outputs": [{ "name": "next_counter", "auth_index": 0, "actors": ["Counter"] }],
+          "witness_recipe_ids": []
+        },
+        "hidden_params": [],
+        "template_selectors": [],
+        "witnesses": [],
+        "consumes": [],
+        "emits": { "kind": "outputs", "outputs": [{ "name": "next_counter", "auth_index": 0, "actors": ["Counter"] }] },
+        "routes": [{ "output": "next_counter", "actor": "Counter", "template_id": "template/counter", "state_expr": "next" }]
+      }]
+    }]
+  },
+  "sil_abi": {
+    "schema_version": 1,
+    "states": [{ "name": "CounterState", "fields": [{ "name": "count", "type": { "kind": "int" } }] }],
+    "contracts": [{
+      "name": "Counter",
+      "source_path": "sil/Counter.sil",
+      "runtime_state": { "source": "CounterState", "fields": [{ "name": "count", "type": { "kind": "int" } }] },
+      "entries": [{
+        "name": "bump",
+        "selector": null,
+        "params": [{ "name": "delta", "type": { "kind": "int" } }]
+      }],
+      "compiled": {
+        "script_hex": "080000000000000000b9cb519c697652799358cd01087c7eb976c976013c9459937cbc7eaa02000001aa7e01207e7c7e01877eb900ccc38769757551",
+        "template_hash_hex": "b6dcd7d97abc86da83cfa20668734d35369012c206d6cca3964fceaa694d895f",
+        "state_span": { "offset": 0, "len": 9 }
+      }
+    }]
+  }
+}

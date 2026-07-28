@@ -1,6 +1,6 @@
 # Architecture
 
-Six crates + a no-build web app, strict boundaries:
+Seven crates + a no-build web app, strict boundaries:
 
 ```
 crates/
@@ -11,6 +11,7 @@ crates/
 │   ├── store.rs     the [[Storage Schema]]
 │   └── detect.rs    tx → covenant sightings
 ├── kascov-decode/   [[Decoding]] — disassembler, P2SH reveals, template registry
+├── kascov-argent/   approved Argent artifacts + bounded `ARGI` state envelopes
 ├── kascov-sim/      off-chain script-engine harness — powers /simulate, /debug
 │                    (real-witness replay) and /zk-verify
 ├── kascov/          the CLI + the `serve` worker ([[CLI Reference]])
@@ -34,9 +35,17 @@ The web directory is itself split by responsibility: `app.js` owns views and DOM
 
 **Rule 4 — decoding never blocks shipping.** Lineage tracing is format-agnostic; the [[Decoding]] fallback (full disassembly) is always correct. Template-specific decoders are additive.
 
-**Rule 5 — live data must not own the reader.** Chain activity may invalidate caches, but it may not erase typed input, collapse an open story, replay a page transition, move focus, or multiply identical network requests. Browser refresh work is keyed and coalesced; only real navigation performs navigation effects. See [[Web Explorer#Live refresh model]].
+**Rule 5 — isolate Argent's consensus dependency.** `kascov-argent` pins Argent
+commit `4805ebd` and privately uses Argent's Rusty Kaspa `v2.0.1` types. Kascov's
+node boundary remains pinned to `98a4ccd`. The Argent facade accepts only
+Kascov stable values and returns owned script and covenant bytes. No
+Argent-owned Kaspa type appears in a public signature. This narrow exception
+exists because the pinned Argent runtime must verify exact artifact output
+bytes before Kascov stores application state.
 
-**Rule 6 — one application shell.** Product documentation that behaves like a page belongs inside the shared shell, with the normal header, search, routing, accessibility, and responsive system. The builder guide is static semantic HTML inside `index.html`, not a second hand-maintained site. Compatibility redirects preserve already-shared standalone URLs.
+**Rule 6 — live data must not own the reader.** Chain activity may invalidate caches, but it may not erase typed input, collapse an open story, replay a page transition, move focus, or multiply identical network requests. Browser refresh work is keyed and coalesced; only real navigation performs navigation effects. See [[Web Explorer#Live refresh model]].
+
+**Rule 7 — one application shell.** Product documentation that behaves like a page belongs inside the shared shell, with the normal header, search, routing, accessibility, and responsive system. The builder guide is static semantic HTML inside `index.html`, not a second hand-maintained site. Compatibility redirects preserve already-shared standalone URLs.
 
 ## Deployment topology (live since July 22)
 

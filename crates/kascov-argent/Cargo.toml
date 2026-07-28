@@ -1,0 +1,20 @@
+[package]
+name = "kascov-argent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+argent-artifact.workspace = true
+argent-runtime.workspace = true
+kascov-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+argent-kaspa-consensus-core = { package = "kaspa-consensus-core", git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+
+[dev-dependencies]
+tempfile = "3"

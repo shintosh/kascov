@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kascov-core", "crates/kascov-decode", "crates/kascov-sim", "crates/kascov", "crates/kascov-labkit", "crates/kascov-lab", "crates/kascov-bench"]
+members = ["crates/kascov-core", "crates/kascov-decode", "crates/kascov-sim", "crates/kascov", "crates/kascov-labkit", "crates/kascov-lab", "crates/kascov-bench", "crates/kascov-argent"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,11 @@ repository = "https://github.com/Knitser/kascov"
 kascov-core = { path = "crates/kascov-core" }
 kascov-decode = { path = "crates/kascov-decode" }
 kascov-sim = { path = "crates/kascov-sim" }
+kascov-argent = { path = "crates/kascov-argent" }
+
+# Argent applications are verified against this exact compiler/runtime revision.
+argent-artifact = { git = "https://github.com/michaelsutton/argent.git", rev = "4805ebd448c73c1543b69114bb10192b6d12e850" }
+argent-runtime = { git = "https://github.com/michaelsutton/argent.git", rev = "4805ebd448c73c1543b69114bb10192b6d12e850" }
 
 # Kaspa crates are frozen pre-Toccata on crates.io — pin git deps to a single rev.
 # This rev must be wire-compatible with the node kascov connects to (borsh wRPC is
@@ -44,6 +49,7 @@ comfy-table = "7"
 hex = "0.4"
 futures = "0.3"
 getrandom = "0.3"
+sha2 = "0.10"
 # SVG -> PNG for the /og share cards; text+antialiasing, no system deps.
 resvg = "0.45"
 
