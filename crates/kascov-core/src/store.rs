@@ -1285,9 +1285,11 @@ fn validate_backup_target(source: &Path, out: &Path) -> Result<std::path::PathBu
     wal.push("-wal");
     let mut shm = source.as_os_str().to_os_string();
     shm.push("-shm");
+    let writer_lock = crate::writer::lock_path(&source)?;
     if out == source
         || out == Path::new(&wal)
         || out == Path::new(&shm)
+        || out == writer_lock
         || (out.exists() && same_file::is_same_file(&source, &out).map_err(backup_path_error)?)
     {
         return Err(Error::Invalid {
@@ -6399,8 +6401,10 @@ mod tests {
         let source = live.join("database.db");
         std::fs::write(&source, b"live").unwrap();
         let alias = live.join("missing").join("..").join("database.db");
+        let writer_lock = live.join("database.db.writer.lock");
 
         assert!(validate_backup_target(&source, &alias).is_err());
+        assert!(validate_backup_target(&source, &writer_lock).is_err());
     }
 
     #[test]

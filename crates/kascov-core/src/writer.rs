@@ -24,7 +24,7 @@ impl WriterLease {
     }
 }
 
-fn lock_path(database: &Path) -> Result<PathBuf> {
+pub(crate) fn lock_path(database: &Path) -> Result<PathBuf> {
     let file_name = database.file_name().ok_or_else(|| Error::Invalid {
         what: "writer lease path",
         value: database.display().to_string(),
