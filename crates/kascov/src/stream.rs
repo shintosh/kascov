@@ -62,6 +62,8 @@ pub(super) struct DeliveryHub {
     max_subscribers: usize,
     replays: std::sync::Arc<tokio::sync::Semaphore>,
     max_replays: usize,
+    resets: std::sync::Arc<tokio::sync::Semaphore>,
+    max_resets: usize,
 }
 
 impl DeliveryHub {
@@ -73,6 +75,8 @@ impl DeliveryHub {
             max_subscribers: limits.max_streams,
             replays: std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_replays)),
             max_replays: limits.max_replays,
+            resets: std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_streams)),
+            max_resets: limits.max_streams,
         }
     }
 
@@ -90,10 +94,16 @@ impl DeliveryHub {
         self.replays.clone().try_acquire_owned().ok()
     }
 
+    fn try_reset(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.resets.clone().try_acquire_owned().ok()
+    }
+
     pub(super) fn capacity_json(&self, limits: CapacityLimits) -> serde_json::Value {
         serde_json::json!({
             "max_streams": self.max_subscribers,
             "active_streams": self.subscribers.load(std::sync::atomic::Ordering::Relaxed),
+            "max_reset_streams": self.max_resets,
+            "active_reset_streams": self.max_resets.saturating_sub(self.resets.available_permits()),
             "max_historical_replays": self.max_replays,
             "active_historical_replays": self.max_replays.saturating_sub(self.replays.available_permits()),
             "replay_page_records": limits.replay_page_size,
@@ -582,6 +592,7 @@ fn capacity_response(
 
 fn reset_only_stream(
     slot: SubscriberSlot,
+    reset_permit: tokio::sync::OwnedSemaphorePermit,
     reset: axum::response::sse::Event,
     deadline: tokio::time::Instant,
 ) -> impl futures::Stream<
@@ -589,9 +600,10 @@ fn reset_only_stream(
 > + Send {
     drop(slot);
     futures::stream::once(async { Ok(reset) }).chain(futures::stream::unfold(
-        (),
-        move |_| async move {
+        reset_permit,
+        move |permit| async move {
             tokio::time::sleep_until(deadline).await;
+            drop(permit);
             None
         },
     ))
@@ -667,6 +679,12 @@ pub(super) async fn stream_handler(
     };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
     if let StreamStart::Reset { reason, current } = start {
+        let Some(reset_permit) = delivery_hub.try_reset() else {
+            return capacity_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "reset stream capacity exhausted; retry",
+            );
+        };
         let reset = Event::default()
             .retry(std::time::Duration::from_secs(1))
             .event("reset")
@@ -677,7 +695,7 @@ pub(super) async fn stream_handler(
                 "snapshot": format!("/data/{network}.json"),
             }))
             .expect("reset JSON is serializable");
-        let stream = reset_only_stream(slot, reset, deadline);
+        let stream = reset_only_stream(slot, reset_permit, reset, deadline);
         let mut response = Sse::new(stream)
             .keep_alive(
                 KeepAlive::new()
@@ -827,13 +845,18 @@ mod tests {
             ..test_limits()
         });
         let slot = hub.try_subscribe().unwrap();
-        let _reset_stream = reset_only_stream(
+        let reset_permit = hub.try_reset().unwrap();
+        let reset_stream = reset_only_stream(
             slot,
+            reset_permit,
             axum::response::sse::Event::default().event("reset").data("{}"),
             tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         );
 
         assert!(hub.try_subscribe().is_some());
+        assert!(hub.try_reset().is_none());
+        drop(reset_stream);
+        assert!(hub.try_reset().is_some());
     }
 
     #[test]
@@ -842,6 +865,8 @@ mod tests {
         let hub = DeliveryHub::new(limits);
         let capacity = hub.capacity_json(limits);
         assert_eq!(Some(512), capacity["max_streams"].as_u64());
+        assert_eq!(Some(512), capacity["max_reset_streams"].as_u64());
+        assert_eq!(Some(0), capacity["active_reset_streams"].as_u64());
         assert_eq!(Some(32), capacity["max_historical_replays"].as_u64());
         assert_eq!(
             Some(DEFAULT_REPLAY_PAGE_SIZE),
