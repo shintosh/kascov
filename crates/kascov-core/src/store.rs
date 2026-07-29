@@ -1260,6 +1260,35 @@ fn backup_path_error(error: std::io::Error) -> Error {
     }
 }
 
+fn resolved_database_path(path: &Path) -> Result<std::path::PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path).map_err(|error| Error::Invalid {
+            what: "db path",
+            value: error.to_string(),
+        });
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| Error::Invalid {
+                what: "db path",
+                value: error.to_string(),
+            })?
+            .join(path)
+    };
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|error| Error::Invalid {
+        what: "db path",
+        value: error.to_string(),
+    })?;
+    let name = absolute.file_name().ok_or_else(|| Error::Invalid {
+        what: "db path",
+        value: path.display().to_string(),
+    })?;
+    Ok(parent.join(name))
+}
+
 fn resolved_backup_path(path: &Path) -> Result<std::path::PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1382,8 +1411,9 @@ impl Store {
                 value: e.to_string(),
             })?;
         }
-        let writer_lease = crate::writer::WriterLease::acquire(path)?;
-        let conn = Connection::open(path).map_err(db_err)?;
+        let path = resolved_database_path(path)?;
+        let writer_lease = crate::writer::WriterLease::acquire(&path)?;
+        let conn = Connection::open(&path).map_err(db_err)?;
         let legacy_schema = conn
             .query_row(
                 "SELECT EXISTS(
@@ -1649,9 +1679,10 @@ impl Store {
     }
 
     pub fn open_reader(path: &Path, network: Network) -> Result<Self> {
+        let path = resolved_database_path(path)?;
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(path, flags).map_err(db_err)?;
+        let conn = Connection::open_with_flags(&path, flags).map_err(db_err)?;
         conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(db_err)?;
         conn.pragma_update(None, "query_only", true).map_err(db_err)?;
         let existing: String = conn

@@ -1057,6 +1057,28 @@ mod tests {
         Store::open(&path, Network::Testnet(10)).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn writer_lease_uses_the_canonical_database_identity() {
+        let base = std::env::temp_dir().join(format!(
+            "kascov-writer-alias-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let database = base.join("database.db");
+        let alias = base.join("alias.db");
+        let _ = std::fs::remove_file(&database);
+        let _ = std::fs::remove_file(&alias);
+        let writer = Store::open(&database, Network::Testnet(10)).unwrap();
+        std::os::unix::fs::symlink(&database, &alias).unwrap();
+
+        assert!(Store::open(&alias, Network::Testnet(10)).is_err());
+        let writer_lock = base.join("database.db.writer.lock");
+        assert!(Store::backup_database(&alias, Network::Testnet(10), &writer_lock).is_err());
+
+        drop(writer);
+    }
+
     #[test]
     fn online_backup_uses_a_reader_while_the_writer_lease_is_held() {
         let base = std::env::temp_dir().join(format!(
