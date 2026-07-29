@@ -363,7 +363,7 @@ it has never been spent, or the index has not walked the spend yet"
             {
                 anyhow::bail!("repair-argent requires --argent-manifest or KASCOV_ARGENT_MANIFEST");
             }
-            let decoder = application_decoder(&cli)?;
+            let decoder = application_decoder(&cli)?.decoder;
             let mut store = open_store(&cli)?;
             let result = store.repair_application_failures(decoder.as_ref(), batch_size)?;
             if cli.json {
@@ -384,14 +384,69 @@ it has never been spent, or the index has not walked the spend yet"
     }
 }
 
-fn application_decoder(
-    cli: &Cli,
-) -> Result<std::sync::Arc<dyn kascov_core::ApplicationDecoder>> {
+const MAX_ARGENT_MANIFEST_REJECTIONS: usize = 20;
+
+#[derive(Clone, serde::Serialize)]
+struct ArgentManifestRejectionHealth {
+    application_id: String,
+    code: String,
+    detail: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ArgentManifestHealth {
+    configured: bool,
+    approved: usize,
+    rejected: usize,
+    rejections: Vec<ArgentManifestRejectionHealth>,
+}
+
+impl ArgentManifestHealth {
+    fn disabled() -> Self {
+        Self {
+            configured: false,
+            approved: 0,
+            rejected: 0,
+            rejections: Vec::new(),
+        }
+    }
+
+    fn from_parts(
+        configured: bool,
+        approved: usize,
+        rejections: &[kascov_argent::ManifestRejection],
+    ) -> Self {
+        Self {
+            configured,
+            approved,
+            rejected: rejections.len(),
+            rejections: rejections
+                .iter()
+                .take(MAX_ARGENT_MANIFEST_REJECTIONS)
+                .map(|rejection| ArgentManifestRejectionHealth {
+                    application_id: rejection.application_id.clone(),
+                    code: rejection.code.clone(),
+                    detail: rejection.detail.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+struct ApplicationDecoderSetup {
+    decoder: std::sync::Arc<dyn kascov_core::ApplicationDecoder>,
+    health: ArgentManifestHealth,
+}
+
+fn application_decoder(cli: &Cli) -> Result<ApplicationDecoderSetup> {
     let path = cli.argent_manifest.clone().or_else(|| {
         std::env::var_os("KASCOV_ARGENT_MANIFEST").map(std::path::PathBuf::from)
     });
     let Some(path) = path else {
-        return Ok(std::sync::Arc::new(kascov_core::NoApplicationDecoder));
+        return Ok(ApplicationDecoderSetup {
+            decoder: std::sync::Arc::new(kascov_core::NoApplicationDecoder),
+            health: ArgentManifestHealth::disabled(),
+        });
     };
     let manifest = kascov_argent::ApprovedManifest::load(&path)
         .with_context(|| format!("failed to load Argent manifest {}", path.display()))?;
@@ -408,9 +463,38 @@ fn application_decoder(
         manifest.applications().len(),
         path.display()
     );
-    Ok(std::sync::Arc::new(kascov_argent::ArgentDecoder::new(
-        manifest,
-    )))
+    let health = ArgentManifestHealth::from_parts(
+        true,
+        manifest.applications().len(),
+        manifest.rejections(),
+    );
+    Ok(ApplicationDecoderSetup {
+        decoder: std::sync::Arc::new(kascov_argent::ArgentDecoder::new(manifest)),
+        health,
+    })
+}
+
+#[cfg(test)]
+mod argent_manifest_health_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_keep_counts_and_bound_rejection_details() {
+        let rejections: Vec<_> = (0..25)
+            .map(|index| kascov_argent::ManifestRejection {
+                application_id: format!("app-{index}"),
+                code: "artifact_hash_mismatch".into(),
+                detail: "artifact digest differs".into(),
+            })
+            .collect();
+
+        let health = ArgentManifestHealth::from_parts(true, 2, &rejections);
+        let json = serde_json::to_value(health).unwrap();
+
+        assert_eq!(2, json["approved"]);
+        assert_eq!(25, json["rejected"]);
+        assert_eq!(20, json["rejections"].as_array().unwrap().len());
+    }
 }
 
 fn export(cli: &Cli, out: Option<std::path::PathBuf>, max_events: u64) -> Result<()> {
@@ -1136,7 +1220,7 @@ async fn inspect_tx(cli: &Cli, txid: TxId) -> Result<()> {
 
 async fn sync(cli: &Cli, from: Option<BlockHash>, follow: bool, watch: bool) -> Result<()> {
     let mut store = open_store(cli)?;
-    let decoder = application_decoder(cli)?;
+    let decoder = application_decoder(cli)?.decoder;
     loop {
         let node = match NodeHandle::connect(cli.network, cli.rpc.as_deref()).await {
             Ok(node) => node,
@@ -1629,6 +1713,8 @@ struct ServeState {
     max_events: u64,
     capacity: stream::CapacityLimits,
     tuning: tuning::TuningProfile,
+    /// Immutable startup approval and rejection summary for Argent artifacts.
+    argent_manifest: ArgentManifestHealth,
     /// Node url for the custodial deploy endpoint (None → public resolver).
     rpc: Option<String>,
     /// Rate limiter shared by the custodial /deploy endpoint.
@@ -1926,7 +2012,8 @@ async fn serve(
     // Probe them before background tasks can create a fresh archive.
     let fresh = fresh_policy_from_env(std::env::var("KASCOV_FRESH_OK").ok().as_deref());
     probe_archives_at_boot(&base_dir, &networks, fresh)?;
-    let decoder = application_decoder(cli)?;
+    let decoder_setup = application_decoder(cli)?;
+    let decoder = decoder_setup.decoder;
 
 
     let mut deliveries = Vec::with_capacity(networks.len());
@@ -1941,14 +2028,7 @@ async fn serve(
         let pending_hub = PendingHub::new();
         let pending_set = std::sync::Arc::new(tokio::sync::Mutex::new(PendingFeed::new()));
         let metrics = std::sync::Arc::new(kascov_core::performance::PerformanceMetrics::new());
-        let health = std::sync::Arc::new(SyncHealth {
-            last_node_notification_ms: std::sync::atomic::AtomicI64::new(0),
-            last_reconciliation_start_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
-            notification_to_reconciliation_ms: std::sync::atomic::AtomicU64::new(0),
-            last_sync_ok_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
-            last_progress_ms: std::sync::atomic::AtomicI64::new(now_ms() as i64),
-            delivery_high_water: std::sync::atomic::AtomicU64::new(0),
-        });
+        let health = std::sync::Arc::new(SyncHealth::new(now_ms()));
         let db = base_dir.join(format!("{network}.db"));
         read_pools.push((
             network,
@@ -2014,6 +2094,7 @@ async fn serve(
         max_events,
         capacity,
         tuning,
+        argent_manifest: decoder_setup.health,
         rpc: cli.rpc.clone(),
         deploy_limiter: tokio::sync::Mutex::new(DeployLimiter::new()),
         tool_limiter: tokio::sync::Mutex::new(ToolLimiter::new()),
@@ -2328,11 +2409,10 @@ async fn healthz_handler(
                         .load(std::sync::atomic::Ordering::Relaxed),
                     h.last_sync_ok_ms.load(std::sync::atomic::Ordering::Relaxed),
                     h.last_progress_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    h.delivery_high_water.load(std::sync::atomic::Ordering::Relaxed),
-
+                    h.delivery_cursor(),
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, 0));
+            .unwrap_or((0, 0, 0, 0, 0, None));
         let db = state.base_dir.join(format!("{network}.db"));
         let read_pool = read_pool_for(&state, network);
         // Nulls until the follower has created the DB; an open/read failure
@@ -2400,6 +2480,7 @@ async fn healthz_handler(
                 "capacity": capacity,
                 "tuning": state.tuning.health_json(),
                 "performance": performance,
+                "argent_manifest": &state.argent_manifest,
             }),
         );
     }

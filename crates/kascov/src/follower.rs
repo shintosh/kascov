@@ -80,8 +80,32 @@ pub(super) struct SyncHealth {
     /// (some nodes answer it with an empty walk) — liveness alone would keep
     /// reporting ok while the index falls behind forever.
     pub(super) last_progress_ms: std::sync::atomic::AtomicI64,
-    /// Highest durable accepted delivery sequence published by this process.
-    pub(super) delivery_high_water: std::sync::atomic::AtomicU64,
+    /// Highest durable accepted cursor, including the database stream epoch.
+    delivery_high_water: std::sync::RwLock<Option<kascov_core::StreamCursor>>,
+}
+
+impl SyncHealth {
+    pub(super) fn new(boot_ms: u64) -> Self {
+        Self {
+            last_node_notification_ms: std::sync::atomic::AtomicI64::new(0),
+            last_reconciliation_start_ms: std::sync::atomic::AtomicI64::new(boot_ms as i64),
+            notification_to_reconciliation_ms: std::sync::atomic::AtomicU64::new(0),
+            last_sync_ok_ms: std::sync::atomic::AtomicI64::new(boot_ms as i64),
+            last_progress_ms: std::sync::atomic::AtomicI64::new(boot_ms as i64),
+            delivery_high_water: std::sync::RwLock::new(None),
+        }
+    }
+
+    pub(super) fn record_delivery_cursor(&self, cursor: kascov_core::StreamCursor) {
+        let mut current = self.delivery_high_water.write().expect("sync health poisoned");
+        if current.is_none_or(|value| value.epoch != cursor.epoch || value.seq < cursor.seq) {
+            *current = Some(cursor);
+        }
+    }
+
+    pub(super) fn delivery_cursor(&self) -> Option<kascov_core::StreamCursor> {
+        *self.delivery_high_water.read().expect("sync health poisoned")
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +132,24 @@ mod writer_mutation_tests {
 
         assert!(requested.await.unwrap().unwrap());
         assert!(Store::open(&path, Network::Testnet(10)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sync_health_tests {
+    use super::*;
+
+    #[test]
+    fn delivery_cursor_restores_and_keeps_the_epoch() {
+        let health = SyncHealth::new(1);
+        let restored: kascov_core::StreamCursor =
+            "00112233445566778899aabbccddeeff:41".parse().unwrap();
+        let published = restored.checked_next().unwrap();
+
+        health.record_delivery_cursor(restored);
+        health.record_delivery_cursor(published);
+
+        assert_eq!(Some(published), health.delivery_cursor());
     }
 }
 
@@ -233,6 +275,10 @@ pub(super) async fn follow_forever(
                 continue;
             }
         };
+        match store.delivery_high_water() {
+            Ok(cursor) => health.record_delivery_cursor(cursor),
+            Err(err) => tracing::warn!("{network}: cannot restore delivery cursor: {err}"),
+        }
         // One-shot per database + derivation version: build the KCC20 token
         // accounting tables from history. Sited here, NOT in Store::open, so
         // the serve path never pays it (WAL readers keep serving while it runs) — and
@@ -334,9 +380,7 @@ pub(super) async fn follow_forever(
                             record.covenant_id,
                             record.cursor
                         );
-                        health
-                            .delivery_high_water
-                            .fetch_max(record.cursor.seq, std::sync::atomic::Ordering::Relaxed);
+                        health.record_delivery_cursor(record.cursor);
                         let record = std::sync::Arc::new(record);
                         if delivery_tx.receiver_count() > 0 {
                             let _ = delivery_tx.send(record.clone());
