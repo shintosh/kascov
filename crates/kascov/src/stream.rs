@@ -58,6 +58,8 @@ impl PendingBroadcast {
 /// One network's post-commit accepted-record fan-out.
 pub(super) struct DeliveryHub {
     pub(super) tx: tokio::sync::broadcast::Sender<std::sync::Arc<AcceptedBroadcast>>,
+    streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max_streams: usize,
     subscribers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max_subscribers: usize,
     replays: std::sync::Arc<tokio::sync::Semaphore>,
@@ -71,6 +73,8 @@ impl DeliveryHub {
         let (tx, _) = tokio::sync::broadcast::channel(DELIVERY_BUFFER);
         Self {
             tx,
+            streams: Default::default(),
+            max_streams: limits.max_streams,
             subscribers: Default::default(),
             max_subscribers: limits.max_streams,
             replays: std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_replays)),
@@ -82,12 +86,21 @@ impl DeliveryHub {
 
     fn try_subscribe(&self) -> Option<SubscriberSlot> {
         use std::sync::atomic::Ordering;
-        let previous = self.subscribers.fetch_add(1, Ordering::AcqRel);
-        if previous >= self.max_subscribers {
-            self.subscribers.fetch_sub(1, Ordering::AcqRel);
+        let total = self.streams.fetch_add(1, Ordering::AcqRel);
+        if total >= self.max_streams {
+            self.streams.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        Some(SubscriberSlot(self.subscribers.clone()))
+        let accepted = self.subscribers.fetch_add(1, Ordering::AcqRel);
+        if accepted >= self.max_subscribers {
+            self.subscribers.fetch_sub(1, Ordering::AcqRel);
+            self.streams.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(SubscriberSlot {
+            streams: Some(self.streams.clone()),
+            subscribers: Some(self.subscribers.clone()),
+        })
     }
 
     fn try_replay(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -100,8 +113,10 @@ impl DeliveryHub {
 
     pub(super) fn capacity_json(&self, limits: CapacityLimits) -> serde_json::Value {
         serde_json::json!({
-            "max_streams": self.max_subscribers,
-            "active_streams": self.subscribers.load(std::sync::atomic::Ordering::Relaxed),
+            "max_streams": self.max_streams,
+            "active_streams": self.streams.load(std::sync::atomic::Ordering::Relaxed),
+            "max_accepted_streams": self.max_subscribers,
+            "active_accepted_streams": self.subscribers.load(std::sync::atomic::Ordering::Relaxed),
             "max_reset_streams": self.max_resets,
             "active_reset_streams": self.max_resets.saturating_sub(self.resets.available_permits()),
             "max_historical_replays": self.max_replays,
@@ -130,9 +145,33 @@ impl PendingHub {
 
 /// Frees a subscriber slot when its SSE stream is dropped (client gone,
 /// keep-alive write failed, or the connection timed out).
-struct SubscriberSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+struct SubscriberSlot {
+    streams: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    subscribers: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl SubscriberSlot {
+    fn into_reset(mut self) -> StreamSlot {
+        let subscribers = self.subscribers.take().expect("accepted stream slot is held");
+        subscribers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        StreamSlot(self.streams.take().expect("total stream slot is held"))
+    }
+}
 
 impl Drop for SubscriberSlot {
+    fn drop(&mut self) {
+        if let Some(subscribers) = self.subscribers.take() {
+            subscribers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        if let Some(streams) = self.streams.take() {
+            streams.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+struct StreamSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for StreamSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -598,12 +637,13 @@ fn reset_only_stream(
 ) -> impl futures::Stream<
     Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>,
 > + Send {
-    drop(slot);
+    let stream_slot = slot.into_reset();
     futures::stream::once(async { Ok(reset) }).chain(futures::stream::unfold(
-        reset_permit,
-        move |permit| async move {
+        (stream_slot, reset_permit),
+        move |(stream_slot, permit)| async move {
             tokio::time::sleep_until(deadline).await;
             drop(permit);
+            drop(stream_slot);
             None
         },
     ))
@@ -853,9 +893,14 @@ mod tests {
             tokio::time::Instant::now() + std::time::Duration::from_secs(60),
         );
 
-        assert!(hub.try_subscribe().is_some());
+        let capacity = hub.capacity_json(test_limits());
+        assert_eq!(Some(1), capacity["active_streams"].as_u64());
+        assert_eq!(Some(0), capacity["active_accepted_streams"].as_u64());
+        assert_eq!(Some(1), capacity["active_reset_streams"].as_u64());
+        assert!(hub.try_subscribe().is_none());
         assert!(hub.try_reset().is_none());
         drop(reset_stream);
+        assert!(hub.try_subscribe().is_some());
         assert!(hub.try_reset().is_some());
     }
 
@@ -1059,9 +1104,14 @@ mod tests {
         DurableStreamState {
             delivery_rx,
             pending_rx,
-            _slot: SubscriberSlot(std::sync::Arc::new(
-                std::sync::atomic::AtomicUsize::new(1),
-            )),
+            _slot: SubscriberSlot {
+                streams: Some(std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(1),
+                )),
+                subscribers: Some(std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(1),
+                )),
+            },
             filter,
             performance: std::sync::Arc::new(
                 kascov_core::performance::PerformanceMetrics::new(),
