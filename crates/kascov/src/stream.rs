@@ -381,7 +381,7 @@ async fn replay_page(
 ) -> kascov_core::Result<Vec<kascov_core::DeliveryRecord>> {
     tokio::task::spawn_blocking(move || {
         read_pool.query(|store| {
-            let mut page = store.delivery_page(Some(after), page_size)?;
+            let mut page = store.delivery_replay_page(Some(after), page_size)?;
             page.retain(|record| record.cursor.seq <= through.seq);
             Ok(page)
         })

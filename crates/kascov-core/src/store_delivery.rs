@@ -7,6 +7,9 @@ use crate::delivery::{DeliveryRecord, StreamCursor, StreamEpoch};
 use crate::store::Store;
 use crate::{BlockHash, CovenantId, Error, Result};
 
+const MAX_PUBLIC_DELIVERY_PAGE: u64 = 1_001;
+pub const MAX_DELIVERY_REPLAY_PAGE: u64 = 1_024;
+
 const DELIVERY_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS delivery_log (
     stream_seq INTEGER PRIMARY KEY,
@@ -548,11 +551,34 @@ impl Store {
         self.delivery_page_filtered(after, limit, &DeliveryFilter::default())
     }
 
+    pub fn delivery_replay_page(
+        &self,
+        after: Option<StreamCursor>,
+        limit: u64,
+    ) -> Result<Vec<DeliveryRecord>> {
+        self.delivery_page_filtered_with_cap(
+            after,
+            limit,
+            &DeliveryFilter::default(),
+            MAX_DELIVERY_REPLAY_PAGE,
+        )
+    }
+
     pub fn delivery_page_filtered(
         &self,
         after: Option<StreamCursor>,
         limit: u64,
         filter: &DeliveryFilter,
+    ) -> Result<Vec<DeliveryRecord>> {
+        self.delivery_page_filtered_with_cap(after, limit, filter, MAX_PUBLIC_DELIVERY_PAGE)
+    }
+
+    fn delivery_page_filtered_with_cap(
+        &self,
+        after: Option<StreamCursor>,
+        limit: u64,
+        filter: &DeliveryFilter,
+        max_limit: u64,
     ) -> Result<Vec<DeliveryRecord>> {
         let epoch = self.stream_epoch()?;
         if let Some(cursor) = after {
@@ -593,7 +619,7 @@ impl Store {
                     filter.application_id.as_deref(),
                     artifact_id,
                     filter.actor_path.as_deref(),
-                    limit.clamp(1, 1001),
+                    limit.clamp(1, max_limit),
                 ],
                 |row| row.get::<_, String>(0),
             )
@@ -893,6 +919,42 @@ mod tests {
                 10,
             )
             .is_err());
+    }
+
+    #[test]
+    fn replay_page_honors_the_full_internal_candidate() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-delivery-replay-limit-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let mut batch = accepted_batch(1, 9);
+        let event = &batch.events[0];
+        let covenant_id = event.covenant_id;
+        let kind = event.kind;
+        let txid = event.txid;
+        let tx_index = event.tx_index;
+        let payload = event.payload.clone();
+        let lane_namespace = event.lane_namespace.clone();
+        batch.events = (0..1_100)
+            .map(|event_index| NewEvent {
+                covenant_id,
+                kind,
+                txid,
+                tx_index,
+                event_index,
+                payload: payload.clone(),
+                lane_namespace: lane_namespace.clone(),
+            })
+            .collect();
+        store.apply_accepted_block(&batch).unwrap();
+
+        assert_eq!(1_001, store.delivery_page(None, u64::MAX).unwrap().len());
+        assert_eq!(
+            1_024,
+            store.delivery_replay_page(None, 1_024).unwrap().len()
+        );
     }
 
     #[test]
