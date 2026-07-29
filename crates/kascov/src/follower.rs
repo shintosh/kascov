@@ -1,14 +1,31 @@
 use super::*;
 
 const WRITER_MUTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MUTATION_QUEUED: u8 = 0;
+const MUTATION_RUNNING: u8 = 1;
+const MUTATION_CANCELED: u8 = 2;
 
 type WriterOperation = Box<dyn FnOnce(&mut Store) + Send + 'static>;
 
-pub(super) struct WriterMutation(WriterOperation);
+pub(super) struct WriterMutation {
+    operation: WriterOperation,
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
 
 impl WriterMutation {
     fn apply(self, store: &mut Store) {
-        (self.0)(store);
+        if self
+            .state
+            .compare_exchange(
+                MUTATION_QUEUED,
+                MUTATION_RUNNING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            (self.operation)(store);
+        }
     }
 }
 
@@ -24,15 +41,36 @@ impl WriterHandle {
         F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
     {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(MUTATION_QUEUED));
         self.tx
-            .try_send(WriterMutation(Box::new(move |store| {
-                let _ = result_tx.send(operation(store));
-            })))
+            .try_send(WriterMutation {
+                operation: Box::new(move |store| {
+                    let _ = result_tx.send(operation(store));
+                }),
+                state: state.clone(),
+            })
             .map_err(|err| anyhow::anyhow!("canonical writer unavailable: {err}"))?;
-        tokio::time::timeout(WRITER_MUTATION_TIMEOUT, result_rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("canonical writer mutation timed out"))?
-            .map_err(|_| anyhow::anyhow!("canonical writer stopped before mutation completed"))?
+        let mut result_rx = result_rx;
+        match tokio::time::timeout(WRITER_MUTATION_TIMEOUT, &mut result_rx).await {
+            Ok(result) => result
+                .map_err(|_| anyhow::anyhow!("canonical writer stopped before mutation completed"))?,
+            Err(_) => {
+                if state
+                    .compare_exchange(
+                        MUTATION_QUEUED,
+                        MUTATION_CANCELED,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    anyhow::bail!("canonical writer mutation timed out");
+                }
+                result_rx.await.map_err(|_| {
+                    anyhow::anyhow!("canonical writer stopped before mutation completed")
+                })?
+            }
+        }
     }
 }
 
@@ -132,6 +170,29 @@ mod writer_mutation_tests {
 
         assert!(requested.await.unwrap().unwrap());
         assert!(Store::open(&path, Network::Testnet(10)).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_queued_mutation_can_never_apply_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer-timeout.db");
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let (writer, mut mutations) = writer_channel(1);
+
+        let requested = tokio::spawn(async move {
+            writer
+                .mutate(|store| {
+                    store.put_verified_source("hash", "00", "source", "", None, 1)?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(WRITER_MUTATION_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert!(requested.await.unwrap().is_err());
+
+        mutations.recv().await.unwrap().apply(&mut store);
+        assert!(store.get_verified_source("hash").unwrap().is_none());
     }
 }
 
@@ -334,7 +395,12 @@ pub(super) async fn follow_forever(
         if !store.tx_index_backfill_done().unwrap_or(true) {
             let since_boot = boot.elapsed();
             if since_boot < TX_BACKFILL_BOOT_DELAY {
-                tokio::time::sleep(TX_BACKFILL_BOOT_DELAY - since_boot).await;
+                await_with_mutations(
+                    tokio::time::sleep(TX_BACKFILL_BOOT_DELAY - since_boot),
+                    &mut writer_mutations,
+                    &mut store,
+                )
+                .await;
             }
         }
         match kascov_core::sync::backfill_tx_index(&node, &mut store).await {
@@ -466,7 +532,12 @@ pub(super) async fn follow_forever(
                             trigger = performance::ReconcileTrigger::Watchdog;
                             continue;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        await_with_mutations(
+                            tokio::time::sleep(std::time::Duration::from_secs(5)),
+                            &mut writer_mutations,
+                            &mut store,
+                        )
+                        .await;
                         break 'connected;
                     }
                 }
