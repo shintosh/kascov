@@ -105,6 +105,7 @@ where
 /// initialized to boot time so a fresh instance gets the same 10-minute grace
 /// as a healthy one.
 pub(super) struct SyncHealth {
+    boot_ms: i64,
     /// Most recent virtual-chain notification observed from the node.
     pub(super) last_node_notification_ms: std::sync::atomic::AtomicI64,
     /// Most recent reconciliation start, regardless of its trigger.
@@ -125,13 +126,30 @@ pub(super) struct SyncHealth {
 impl SyncHealth {
     pub(super) fn new(boot_ms: u64) -> Self {
         Self {
+            boot_ms: boot_ms as i64,
             last_node_notification_ms: std::sync::atomic::AtomicI64::new(0),
             last_reconciliation_start_ms: std::sync::atomic::AtomicI64::new(boot_ms as i64),
             notification_to_reconciliation_ms: std::sync::atomic::AtomicU64::new(0),
-            last_sync_ok_ms: std::sync::atomic::AtomicI64::new(boot_ms as i64),
+            last_sync_ok_ms: std::sync::atomic::AtomicI64::new(0),
             last_progress_ms: std::sync::atomic::AtomicI64::new(boot_ms as i64),
             delivery_high_water: std::sync::RwLock::new(None),
         }
+    }
+
+    pub(super) fn last_sync_ok_ms(&self) -> Option<i64> {
+        let value = self
+            .last_sync_ok_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (value > 0).then_some(value)
+    }
+
+    pub(super) fn stall_reference_ms(&self) -> i64 {
+        self.last_sync_ok_ms().unwrap_or(self.boot_ms)
+    }
+
+    pub(super) fn record_sync_ok(&self, at_ms: i64) {
+        self.last_sync_ok_ms
+            .store(at_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(super) fn record_delivery_cursor(&self, cursor: kascov_core::StreamCursor) {
@@ -199,6 +217,23 @@ mod writer_mutation_tests {
 #[cfg(test)]
 mod sync_health_tests {
     use super::*;
+
+    #[test]
+    fn sync_success_is_absent_until_recorded_without_losing_boot_grace() {
+        let health = SyncHealth::new(1_000);
+
+        assert_eq!(None, health.last_sync_ok_ms());
+        assert_eq!(
+            serde_json::Value::Null,
+            serde_json::json!(health.last_sync_ok_ms())
+        );
+        assert_eq!(1_000, health.stall_reference_ms());
+
+        health.record_sync_ok(1_250);
+
+        assert_eq!(Some(1_250), health.last_sync_ok_ms());
+        assert_eq!(1_250, health.stall_reference_ms());
+    }
 
     #[test]
     fn delivery_cursor_restores_and_keeps_the_epoch() {
@@ -496,9 +531,7 @@ pub(super) async fn follow_forever(
                     Ok(_) => {
                         consecutive_errors = 0;
                         let now = now_ms() as i64;
-                        health
-                            .last_sync_ok_ms
-                            .store(now, std::sync::atomic::Ordering::Relaxed);
+                        health.record_sync_ok(now);
                         let verdict = progress.observe(
                             store.processed_daa().ok().flatten(),
                             store.tip().ok().flatten().map(|(daa, _)| daa),

@@ -140,7 +140,7 @@ curl -s https://kascov.io/openapi.json | jq .openapi
 | `/data/{net}/subscribe`, `unsubscribe` | Webhooks (`{url, covenant_id?, kind?}`), delivered with SSRF guards. |
 | `/share/{net}/{id}`, `/og/{net}/{id}`, `/badge/{net}/{id}`, `/img/{net}/{id}` | Shareable coin page, rendered OG PNG, SVG badge, hash-verified token art. |
 | `/openapi.json`, `/data/{net}/index.json` | OpenAPI 3.1 contract and compact per-network endpoint discovery. |
-| `/healthz`, `/sitemap.xml`, `/feed.xml` | Sync state per network, crawlable coin index, changelog feed. |
+| `/healthz`, `/sitemap.xml`, `/feed.xml` | Sync state per network, crawlable coin index, changelog feed. `last_sync_ok_ms` is null until the first successful sync pass. |
 
 **Pagination.** A bare grid request returns a first page capped at 20,000 rows, newest activity first. When more remain, the response carries `next_after_daa` + `next_after_id`; pass them back as `?after_daa=&after_id=&limit=` to keep walking (default page 5,000). `/events` uses the same shape with `after_seq`.
 

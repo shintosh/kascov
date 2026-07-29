@@ -2397,6 +2397,7 @@ async fn healthz_handler(
             last_reconciliation_start,
             notification_delay,
             last_ok,
+            stall_reference,
             last_progress,
             delivery_high_water,
         ) = state
@@ -2411,12 +2412,13 @@ async fn healthz_handler(
                         .load(std::sync::atomic::Ordering::Relaxed),
                     h.notification_to_reconciliation_ms
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    h.last_sync_ok_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    h.last_sync_ok_ms(),
+                    h.stall_reference_ms(),
                     h.last_progress_ms.load(std::sync::atomic::Ordering::Relaxed),
                     h.delivery_cursor(),
                 )
             })
-            .unwrap_or((0, 0, 0, 0, 0, None));
+            .unwrap_or((0, 0, 0, None, 0, 0, None));
         let db = state.base_dir.join(format!("{network}.db"));
         let read_pool = read_pool_for(&state, network);
         // Nulls until the follower has created the DB; an open/read failure
@@ -2456,7 +2458,7 @@ async fn healthz_handler(
             .find(|(candidate, _)| *candidate == network)
             .map(|(_, hub)| hub.capacity_json(state.capacity))
             .expect("every configured network has delivery capacity");
-        let network_stalled = now.saturating_sub(last_ok) > HEALTHZ_STALL_MS
+        let network_stalled = now.saturating_sub(stall_reference) > HEALTHZ_STALL_MS
             || (lag.is_some_and(|l| l > kascov_core::sync::WEDGE_LAG_DAA)
                 && now.saturating_sub(last_progress) > HEALTHZ_STALL_MS);
         stalled |= network_stalled;
