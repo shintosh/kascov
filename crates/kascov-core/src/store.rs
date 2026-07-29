@@ -1260,7 +1260,7 @@ fn backup_path_error(error: std::io::Error) -> Error {
     }
 }
 
-fn normalized_backup_path(path: &Path) -> Result<std::path::PathBuf> {
+fn resolved_backup_path(path: &Path) -> Result<std::path::PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1269,7 +1269,8 @@ fn normalized_backup_path(path: &Path) -> Result<std::path::PathBuf> {
             .join(path)
     };
     let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
-    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    std::fs::create_dir_all(parent).map_err(backup_path_error)?;
+    let parent = std::fs::canonicalize(parent).map_err(backup_path_error)?;
     let name = absolute.file_name().ok_or_else(|| Error::Invalid {
         what: "backup path",
         value: path.display().to_string(),
@@ -1277,24 +1278,24 @@ fn normalized_backup_path(path: &Path) -> Result<std::path::PathBuf> {
     Ok(parent.join(name))
 }
 
-fn validate_backup_target(source: &Path, out: &Path) -> Result<()> {
+fn validate_backup_target(source: &Path, out: &Path) -> Result<std::path::PathBuf> {
     let source = std::fs::canonicalize(source).map_err(backup_path_error)?;
-    let out_normalized = normalized_backup_path(out)?;
+    let out = resolved_backup_path(out)?;
     let mut wal = source.as_os_str().to_os_string();
     wal.push("-wal");
     let mut shm = source.as_os_str().to_os_string();
     shm.push("-shm");
-    if out_normalized == source
-        || out_normalized == Path::new(&wal)
-        || out_normalized == Path::new(&shm)
-        || (out.exists() && same_file::is_same_file(&source, out).map_err(backup_path_error)?)
+    if out == source
+        || out == Path::new(&wal)
+        || out == Path::new(&shm)
+        || (out.exists() && same_file::is_same_file(&source, &out).map_err(backup_path_error)?)
     {
         return Err(Error::Invalid {
             what: "backup path",
             value: "destination aliases the live database or a SQLite sidecar".into(),
         });
     }
-    Ok(())
+    Ok(out)
 }
 
 fn backup_temporary_path(out: &Path) -> Result<std::path::PathBuf> {
@@ -1816,10 +1817,8 @@ impl Store {
             )
 
             .map_err(db_err)?;
-        validate_backup_target(Path::new(&source), out)?;
-        let parent = out.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(backup_path_error)?;
-        let temporary = backup_temporary_path(out)?;
+        let out = validate_backup_target(Path::new(&source), out)?;
+        let temporary = backup_temporary_path(&out)?;
         let mut cleanup = BackupTemporary(Some(temporary.clone()));
         let mut destination = Connection::open(&temporary).map_err(db_err)?;
         {
@@ -1839,7 +1838,7 @@ impl Store {
             });
         }
         drop(destination);
-        std::fs::rename(&temporary, out).map_err(backup_path_error)?;
+        std::fs::rename(&temporary, &out).map_err(backup_path_error)?;
         cleanup.0 = None;
         Ok(())
     }
@@ -6387,6 +6386,21 @@ mod tests {
         let path = test_store_path("fresh-allow-missing");
         Store::open(&path, Network::Testnet(10)).expect("Allow creates");
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn backup_target_rejects_alias_through_a_missing_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "kascov-backup-alias-{}",
+            std::process::id()
+        ));
+        let live = base.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let source = live.join("database.db");
+        std::fs::write(&source, b"live").unwrap();
+        let alias = live.join("missing").join("..").join("database.db");
+
+        assert!(validate_backup_target(&source, &alias).is_err());
     }
 
     #[test]
