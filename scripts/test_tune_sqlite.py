@@ -18,6 +18,15 @@ def serving_run(point_p95=2.0, page_p95=3.0, failed=0, rss=100):
         },
         "throughput": {"requests_failed": failed},
         "resources": {"rss_bytes": rss},
+        "replay": {
+            "streams_requested": 8,
+            "streams_ready": 8,
+            "streams_completed": 8,
+            "records": 8192,
+            "expected_records": 8192,
+            "cursor_errors": 0,
+            "connection_errors": 0,
+        },
     }
 
 
@@ -75,6 +84,30 @@ class TuneSqliteTest(unittest.TestCase):
             {"status": "no_passing_candidate", **tune_sqlite.INITIAL},
             tune_sqlite.select_serving([candidate]),
         )
+
+    def test_incomplete_or_noncontiguous_replay_cannot_pass(self):
+        run = serving_run()
+        run["replay"]["streams_completed"] = 7
+        self.assertFalse(tune_sqlite._passing_serving_run(run))
+        run = serving_run()
+        run["replay"]["cursor_errors"] = 1
+        self.assertFalse(tune_sqlite._passing_serving_run(run))
+        run = serving_run()
+        run["replay"]["streams_ready"] = 7
+        self.assertFalse(tune_sqlite._passing_serving_run(run))
+
+    def test_replay_bounds_keep_epoch_and_start_before_seeded_history(self):
+        after, current = tune_sqlite._replay_bounds(
+            {"current": "00112233445566778899aabbccddeeff:1024"}
+        )
+        self.assertEqual("00112233445566778899aabbccddeeff:0", after)
+        self.assertEqual("00112233445566778899aabbccddeeff:1024", current)
+
+    def test_replay_bounds_reject_empty_history(self):
+        with self.assertRaises(RuntimeError):
+            tune_sqlite._replay_bounds(
+                {"current": "00112233445566778899aabbccddeeff:0"}
+            )
 
     def test_each_fixed_candidate_is_accepted_by_the_parser(self):
         for name, candidates in tune_sqlite.FIXED.items():

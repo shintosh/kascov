@@ -100,6 +100,8 @@ struct Resources {
 struct FixtureReport {
     schema_version: u32,
     sample_source: &'static str,
+    source_identity: &'static str,
+    node_identity: Option<&'static str>,
     hardware: Hardware,
     workload: Workload,
     latency: Latency,
@@ -178,8 +180,10 @@ fn fixture_report(blocks: u64, events_per_block: u32) -> Result<FixtureReport> {
     std::hint::black_box(checksum);
     let duration_seconds = started.elapsed().as_secs_f64().max(f64::EPSILON);
     Ok(FixtureReport {
-        schema_version: 1,
+        schema_version: 2,
         sample_source: "deterministic_fixture",
+        source_identity: "kascov-bench:fixed-chain:v1",
+        node_identity: None,
         hardware: Hardware {
             os: std::env::consts::OS,
             architecture: std::env::consts::ARCH,
@@ -226,6 +230,21 @@ pub fn validate_report(report: &Value) -> Result<()> {
     match object.get("sample_source").and_then(Value::as_str) {
         Some("deterministic_fixture" | "live_node") => {}
         _ => bail!("sample_source must be deterministic_fixture or live_node"),
+    }
+    if !object
+        .get("source_identity")
+        .and_then(Value::as_str)
+        .is_some_and(|identity| !identity.is_empty())
+    {
+        bail!("source_identity is required");
+    }
+    if object.get("sample_source").and_then(Value::as_str) == Some("live_node")
+        && !object
+            .get("node_identity")
+            .and_then(Value::as_str)
+            .is_some_and(|identity| !identity.is_empty())
+    {
+        bail!("live_node samples require node_identity");
     }
     let latency = object["latency"].as_object().unwrap();
     let observations = latency

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -60,8 +61,14 @@ def sweep_plan(fetch_ahead, wal_autocheckpoint, read_pool, replay_page):
 def _passing_serving_run(run: dict) -> bool:
     point = run["latency"]["point"]
     page = run["latency"]["page"]
+    replay = run["replay"]
     return (
         run["throughput"]["requests_failed"] == 0
+        and replay["streams_requested"] == replay["streams_ready"]
+        and replay["streams_requested"] == replay["streams_completed"]
+        and replay["records"] == replay["expected_records"]
+        and replay["cursor_errors"] == 0
+        and replay["connection_errors"] == 0
         and point["observations"] >= 100
         and page["observations"] >= 100
         and point["p95_ms"] is not None
@@ -162,39 +169,34 @@ def _start_service(args, directory: pathlib.Path, port: int, profile: dict) -> s
     return subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _ensure_fixture(args) -> None:
-    if args.db_fixture.exists():
-        return
+def _ensure_fixture(args) -> str:
     args.db_fixture.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="kascov-tuning-fixture-") as temporary:
-        directory = pathlib.Path(temporary)
-        process = _start_service(args, directory, args.base_port, INITIAL)
-        source = directory / f"{args.network}.db"
-        try:
-            _wait_ready(f"http://127.0.0.1:{args.base_port}", process)
-            deadline = time.monotonic() + 5
-            while not source.exists() and process.poll() is None and time.monotonic() < deadline:
-                time.sleep(0.025)
-        finally:
-            _stop(process)
-        if not source.exists():
-            raise RuntimeError("Kascov did not create the tuning fixture database")
-        completed = subprocess.run(
-            [
-                str(args.kascov_bin),
-                "--network",
-                args.network,
-                "--db",
-                str(source),
-                "backup",
-                "--out",
-                str(args.db_fixture),
-            ],
-            cwd=ROOT,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError("Kascov could not create a consistent tuning fixture backup")
+    completed = subprocess.run(
+        [
+            str(args.kascov_bin.with_name("kascov-bench")),
+            "seed-delivery",
+            "--database",
+            str(args.db_fixture),
+            "--network",
+            args.network,
+            "--records",
+            "1024",
+        ],
+        cwd=ROOT,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("Kascov could not seed the tuning fixture database")
+    digest = hashlib.sha256(args.db_fixture.read_bytes()).hexdigest()
+    return f"sqlite:{args.network}:sha256:{digest}"
+
+
+def _replay_bounds(stream_info: dict) -> tuple[str, str]:
+    current = stream_info["current"]
+    epoch, separator, sequence = current.rpartition(":")
+    if not separator or not epoch or int(sequence) < 1:
+        raise RuntimeError("tuning fixture must expose a non-empty durable stream")
+    return f"{epoch}:0", current
 
 
 def _benchmark_module():
@@ -249,7 +251,9 @@ def _run_ingestion(args, plan: dict, raw_directory: pathlib.Path) -> list[dict]:
     return candidates
 
 
-def _run_serving(args, plan: dict, raw_directory: pathlib.Path) -> list[dict]:
+def _run_serving(
+    args, plan: dict, raw_directory: pathlib.Path, source_identity: str
+) -> list[dict]:
     benchmark = _benchmark_module()
     duration = float(os.environ.get("KASCOV_TUNING_DURATION_SECONDS", "1.25"))
     candidates = []
@@ -268,11 +272,21 @@ def _run_serving(args, plan: dict, raw_directory: pathlib.Path) -> list[dict]:
                         f"serving-{candidate_index}-{multiplier}-{repetition}.json"
                     )
                     try:
-                        _wait_ready(f"http://127.0.0.1:{port}", process)
+                        base = f"http://127.0.0.1:{port}"
+                        _wait_ready(base, process)
+                        with urllib.request.urlopen(
+                            f"{base}/data/{args.network}/stream-info.json", timeout=5
+                        ) as response:
+                            stream_after, stream_current = _replay_bounds(
+                                json.load(response)
+                            )
                         benchmark.run(
                             argparse.Namespace(
-                                base=f"http://127.0.0.1:{port}",
+                                base=base,
                                 network=args.network,
+                                sample_source="deterministic_fixture",
+                                source_identity=source_identity,
+                                node_identity=None,
                                 duration_seconds=duration,
                                 streams=min(512, 8 * multiplier),
                                 point_rps=100 * multiplier,
@@ -281,6 +295,8 @@ def _run_serving(args, plan: dict, raw_directory: pathlib.Path) -> list[dict]:
                                 database=str(directory / f"{args.network}.db"),
                                 service_pid=process.pid,
                                 timeout_seconds=5.0,
+                                stream_after=stream_after,
+                                stream_current=stream_current,
                             )
                         )
                         runs.append(json.loads(raw.read_text()))
@@ -298,7 +314,7 @@ def _run_serving(args, plan: dict, raw_directory: pathlib.Path) -> list[dict]:
 
 
 def run(args) -> dict:
-    _ensure_fixture(args)
+    source_identity = _ensure_fixture(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     raw_directory = args.output.with_suffix("")
     raw_directory.mkdir(parents=True, exist_ok=True)
@@ -309,9 +325,11 @@ def run(args) -> dict:
         args.replay_page,
     )
     ingestion = _run_ingestion(args, plan, raw_directory)
-    serving = _run_serving(args, plan, raw_directory)
+    serving = _run_serving(args, plan, raw_directory, source_identity)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "sample_source": "deterministic_fixture",
+        "source_identity": source_identity,
         "hardware": _hardware(),
         "network": args.network,
         "binary": str(args.kascov_bin),

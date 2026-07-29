@@ -7,8 +7,10 @@ use serde_json::json;
 
 fn complete_report() -> serde_json::Value {
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "sample_source": "deterministic_fixture",
+        "source_identity": "kascov-bench:fixed-chain:v1",
+        "node_identity": null,
         "hardware": {
             "os": "test-os",
             "architecture": "test-arch",
@@ -70,6 +72,7 @@ fn report_separates_fixture_from_live_samples() {
 
     let mut live = report;
     live["sample_source"] = json!("live_node");
+    live["node_identity"] = json!("wRPC:testnet-10:node-test");
     fixture::validate_report(&live).unwrap();
 
     live["sample_source"] = json!("mixed");

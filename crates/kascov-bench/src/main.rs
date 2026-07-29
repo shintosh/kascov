@@ -1,4 +1,5 @@
 mod fixture;
+mod seed;
 
 use std::path::PathBuf;
 
@@ -80,6 +81,15 @@ enum Command {
         #[command(flatten)]
         tuning: TuningArgs,
     },
+    /// Seed a deterministic SQLite delivery log for replay benchmarks.
+    SeedDelivery {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        network: kascov_core::Network,
+        #[arg(long)]
+        records: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -95,6 +105,15 @@ fn main() -> Result<()> {
             let mut report: serde_json::Value = serde_json::from_slice(&std::fs::read(&output)?)?;
             report["tuning"] = tuning.json();
             std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+            Ok(())
+        }
+        Command::SeedDelivery {
+            database,
+            network,
+            records,
+        } => {
+            let cursor = seed::seed_delivery_store(&database, network, records)?;
+            println!("{cursor}");
             Ok(())
         }
     }
