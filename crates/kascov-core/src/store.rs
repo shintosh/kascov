@@ -1726,11 +1726,17 @@ impl Store {
                 value: e.to_string(),
             })?;
         }
-        let path = out.to_string_lossy();
-        self.conn
-            .execute("VACUUM INTO ?1", [path.as_ref()])
+        let mut destination = Connection::open(out).map_err(db_err)?;
+        let backup = rusqlite::backup::Backup::new(&self.conn, &mut destination).map_err(db_err)?;
+        backup
+            .run_to_completion(256, std::time::Duration::from_millis(10), None)
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Open only a read lease on `source` and write a consistent backup.
+    pub fn backup_database(source: &Path, network: Network, out: &Path) -> Result<()> {
+        Self::open_reader(source, network)?.backup_to(out)
     }
 
     /// Stamp template recognition onto rows that predate the columns (or were

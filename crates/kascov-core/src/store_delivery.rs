@@ -996,6 +996,27 @@ mod tests {
     }
 
     #[test]
+    fn online_backup_uses_a_reader_while_the_writer_lease_is_held() {
+        let base = std::env::temp_dir().join(format!(
+            "kascov-online-backup-{}",
+            std::process::id()
+        ));
+        let source = base.with_extension("source.db");
+        let backup = base.with_extension("backup.db");
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&backup);
+        let writer = Store::open(&source, Network::Testnet(10)).unwrap();
+
+        Store::backup_database(&source, Network::Testnet(10), &backup).unwrap();
+
+        let restored = Store::open_reader(&backup, Network::Testnet(10)).unwrap();
+        assert_eq!(
+            writer.delivery_high_water().unwrap(),
+            restored.delivery_high_water().unwrap()
+        );
+    }
+
+    #[test]
     fn accepted_apply_allocates_once_and_duplicate_returns_committed_rows() {
         let path = std::env::temp_dir().join(format!(
             "kascov-accepted-atomic-{}.db",

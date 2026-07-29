@@ -254,8 +254,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Backup { ref out } => {
-            let store = open_store(&cli)?;
-            store.backup_to(out)?;
+            Store::backup_database(&db_path(&cli), cli.network, out)?;
             eprintln!("backed up {} index to {}", cli.network, out.display());
             Ok(())
         }
