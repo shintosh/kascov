@@ -63,11 +63,54 @@ CREATE INDEX IF NOT EXISTS application_failure_unrepaired
 CREATE INDEX IF NOT EXISTS application_failure_by_block
     ON application_decode_failures(accepting_block);
 
+CREATE TABLE IF NOT EXISTS application_decode_failure_counts (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    total INTEGER NOT NULL CHECK (total >= 0),
+    unrepaired INTEGER NOT NULL CHECK (unrepaired >= 0)
+);
+INSERT INTO application_decode_failure_counts (singleton, total, unrepaired)
+SELECT 1, COUNT(*),
+       COALESCE(SUM(CASE WHEN repaired_stream_seq IS NULL THEN 1 ELSE 0 END), 0)
+FROM application_decode_failures WHERE true
+ON CONFLICT(singleton) DO UPDATE SET
+    total = excluded.total,
+    unrepaired = excluded.unrepaired;
+CREATE TRIGGER IF NOT EXISTS application_failure_count_insert
+AFTER INSERT ON application_decode_failures
+BEGIN
+    UPDATE application_decode_failure_counts
+    SET total = total + 1,
+        unrepaired = unrepaired +
+            CASE WHEN NEW.repaired_stream_seq IS NULL THEN 1 ELSE 0 END
+    WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS application_failure_count_delete
+AFTER DELETE ON application_decode_failures
+BEGIN
+    UPDATE application_decode_failure_counts
+    SET total = total - 1,
+        unrepaired = unrepaired -
+            CASE WHEN OLD.repaired_stream_seq IS NULL THEN 1 ELSE 0 END
+    WHERE singleton = 1;
+END;
+CREATE TRIGGER IF NOT EXISTS application_failure_count_repair
+AFTER UPDATE OF repaired_stream_seq ON application_decode_failures
+WHEN (OLD.repaired_stream_seq IS NULL) <> (NEW.repaired_stream_seq IS NULL)
+BEGIN
+    UPDATE application_decode_failure_counts
+    SET unrepaired = unrepaired +
+            CASE WHEN NEW.repaired_stream_seq IS NULL THEN 1 ELSE -1 END
+    WHERE singleton = 1;
+END;
+
 CREATE TABLE IF NOT EXISTS optional_projection_work (
     delivery_stream_seq INTEGER PRIMARY KEY,
     covenant_ids_json TEXT NOT NULL
 );
 ";
+
+const APPLICATION_DECODE_FAILURE_COUNTS_QUERY: &str =
+    "SELECT total, unrepaired FROM application_decode_failure_counts WHERE singleton = 1";
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(APPLICATION_SCHEMA).map_err(db_err)?;
@@ -455,9 +498,7 @@ impl Store {
     pub fn application_decode_failure_counts(&self) -> Result<ApplicationDecodeFailureCounts> {
         self.conn
             .query_row(
-                "SELECT COUNT(*),
-                        COUNT(*) FILTER (WHERE repaired_stream_seq IS NULL)
-                 FROM application_decode_failures",
+                APPLICATION_DECODE_FAILURE_COUNTS_QUERY,
                 [],
                 |row| {
                     Ok(ApplicationDecodeFailureCounts {
@@ -715,12 +756,7 @@ impl Store {
         )
         .map_err(db_err)?;
         result.failures_remaining = tx
-            .query_row(
-                "SELECT COUNT(*) FROM application_decode_failures
-                 WHERE repaired_stream_seq IS NULL",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(APPLICATION_DECODE_FAILURE_COUNTS_QUERY, [], |row| row.get(1))
             .map_err(db_err)?;
         tx.commit().map_err(db_err)?;
         Ok(result)
@@ -784,7 +820,10 @@ fn db_err(error: rusqlite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationDecodeFailureCounts, ApplicationRepairResult};
+    use super::{
+        ApplicationDecodeFailureCounts, ApplicationRepairResult,
+        APPLICATION_DECODE_FAILURE_COUNTS_QUERY,
+    };
     use crate::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent, NewUtxo, Store};
     use crate::{
         ApplicationDecoder, ApplicationOutput, ApplicationPreprocess, BlockHash,
@@ -816,13 +855,93 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'table' AND name IN (
                     'application_envelopes', 'application_outputs',
-                    'application_decode_failures', 'optional_projection_work'
+                    'application_decode_failures', 'application_decode_failure_counts',
+                    'optional_projection_work'
                  )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(4, tables);
+        assert_eq!(5, tables);
+    }
+
+    #[test]
+    fn decode_failure_counts_are_materialized_and_transactional() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-application-failure-counts-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let count_table: u64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'application_decode_failure_counts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(1, count_table);
+        assert_eq!(
+            ApplicationDecodeFailureCounts::default(),
+            store.application_decode_failure_counts().unwrap()
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO application_decode_failures (
+                    txid, accepting_block, accepting_daa, code, detail
+                 ) VALUES (?1, ?2, 1, 'state', 'invalid')",
+                rusqlite::params![
+                    TxId([1; 32]).0.as_slice(),
+                    BlockHash([2; 32]).0.as_slice(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            ApplicationDecodeFailureCounts {
+                total: 1,
+                unrepaired: 1,
+            },
+            store.application_decode_failure_counts().unwrap()
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE application_decode_failures SET repaired_stream_seq = 7",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            ApplicationDecodeFailureCounts {
+                total: 1,
+                unrepaired: 0,
+            },
+            store.application_decode_failure_counts().unwrap()
+        );
+        store
+            .conn
+            .execute("DELETE FROM application_decode_failures", [])
+            .unwrap();
+        assert_eq!(
+            ApplicationDecodeFailureCounts::default(),
+            store.application_decode_failure_counts().unwrap()
+        );
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {APPLICATION_DECODE_FAILURE_COUNTS_QUERY}"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(plan
+            .iter()
+            .all(|detail| !detail.contains("application_decode_failures")));
     }
 
     #[test]
