@@ -21,7 +21,7 @@ struct TuningArgs {
     wal_autocheckpoint: u32,
     #[arg(long, default_value_t = 4)]
     read_pool: u32,
-    #[arg(long, default_value_t = 512)]
+    #[arg(long, default_value_t = 256)]
     replay_page: u64,
 }
 
@@ -129,7 +129,7 @@ mod tests {
             fetch_ahead: 16,
             wal_autocheckpoint: 1_000,
             read_pool: 4,
-            replay_page: 512,
+            replay_page: 256,
         };
         assert!(selected.validate().is_ok());
         assert_eq!(1, selected.json()["profile_version"]);

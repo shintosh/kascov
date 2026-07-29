@@ -9,7 +9,7 @@ pub const REPLAY_PAGE_CANDIDATES: [u64; 3] = [256, 512, 1_024];
 pub const DEFAULT_FETCH_AHEAD: usize = 16;
 pub const DEFAULT_WAL_AUTOCHECKPOINT: u32 = 1_000;
 pub const DEFAULT_READ_POOL: u32 = 4;
-pub const DEFAULT_REPLAY_PAGE: u64 = 512;
+pub const DEFAULT_REPLAY_PAGE: u64 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TuningProfile {
@@ -85,7 +85,7 @@ mod tests {
         assert_eq!(16, profile.fetch_ahead);
         assert_eq!(1_000, profile.wal_autocheckpoint);
         assert_eq!(4, profile.read_pool);
-        assert_eq!(512, profile.replay_page);
+        assert_eq!(256, profile.replay_page);
         assert_eq!(1, profile.health_json()["profile_version"]);
         assert_eq!("selected", profile.health_json()["profile_status"]);
         assert_eq!(DEFAULT_FETCH_AHEAD, kascov_core::sync::DEFAULT_FETCH_AHEAD);

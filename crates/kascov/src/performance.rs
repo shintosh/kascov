@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(16, snapshot["fetch_ahead"]);
         assert_eq!(1_000, snapshot["wal_autocheckpoint_pages"]);
         assert_eq!(4, snapshot["read_pool_connections"]);
-        assert_eq!(512, snapshot["replay_page_records"]);
+        assert_eq!(256, snapshot["replay_page_records"]);
     }
 
     #[tokio::test(start_paused = true)]

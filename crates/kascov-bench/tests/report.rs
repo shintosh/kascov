@@ -107,5 +107,5 @@ fn emitted_report_exposes_the_selected_stage_2_tuple() {
     assert_eq!(16, report["tuning"]["fetch_ahead"]);
     assert_eq!(1_000, report["tuning"]["wal_autocheckpoint_pages"]);
     assert_eq!(4, report["tuning"]["read_pool_connections"]);
-    assert_eq!(512, report["tuning"]["replay_page_records"]);
+    assert_eq!(256, report["tuning"]["replay_page_records"]);
 }
