@@ -3,7 +3,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use crate::model::*;
 use crate::{Error, Result};
@@ -877,6 +877,18 @@ impl AcceptedTransaction {
             application: decoder.preprocess(tx),
         }
     }
+}
+
+fn application_outputs_by_tx(
+    transactions: &[AcceptedTransaction],
+) -> HashMap<TxId, &[crate::ApplicationOutput]> {
+    let mut outputs = HashMap::with_capacity(transactions.len());
+    for accepted in transactions {
+        outputs
+            .entry(accepted.txid)
+            .or_insert(accepted.application.outputs.as_slice());
+    }
+    outputs
 }
 
 pub struct NewEvent {
@@ -2223,6 +2235,7 @@ impl Store {
                 None => (None, None),
             })
             .collect();
+        let application_outputs = application_outputs_by_tx(&block.transactions);
         let tx = self.conn.transaction().map_err(db_err)?;
         if let Some(processed_daa) =
             crate::store_delivery::canonical_batch_daa(&tx, &block.accepting_block)?
@@ -2387,14 +2400,10 @@ impl Store {
                 params![event.covenant_id.0.as_slice(), block.accepting_daa],
             )
             .map_err(db_err)?;
-            let applications = block
-                .transactions
-                .iter()
-                .find(|accepted| accepted.txid == event.txid)
-                .map(|accepted| {
-                    accepted
-                        .application
-                        .outputs
+            let applications = application_outputs
+                .get(&event.txid)
+                .map(|outputs| {
+                    outputs
                         .iter()
                         .filter(|output| output.covenant_id == event.covenant_id)
                         .cloned()
@@ -6388,6 +6397,38 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_output_index_preserves_first_transaction_and_borrows_outputs() {
+        let output = crate::ApplicationOutput {
+            output_index: 0,
+            covenant_id: CovenantId([3; 32]),
+            application_id: "duel".into(),
+            artifact_id: [4; 32],
+            actor_path: "game".into(),
+            state_json: "{}".into(),
+        };
+        let transaction = |application_outputs| AcceptedTransaction {
+            txid: TxId([1; 32]),
+            transaction: crate::Transaction {
+                txid: TxId([1; 32]),
+                version: 1,
+                inputs: vec![],
+                outputs: vec![],
+                payload: vec![],
+            },
+            application: crate::ApplicationPreprocess {
+                outputs: application_outputs,
+                ..crate::ApplicationPreprocess::default()
+            },
+        };
+        let transactions = vec![transaction(vec![output.clone()]), transaction(vec![])];
+
+        let indexed = application_outputs_by_tx(&transactions);
+
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.get(&TxId([1; 32])).copied(), Some([output].as_slice()));
+    }
 
     fn test_store_path(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
