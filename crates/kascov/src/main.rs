@@ -683,6 +683,7 @@ fn build_grid_snapshot(
         }
     }
     let tip = store.tip()?;
+    let stream_cursor = store.delivery_high_water()?;
     let rows: Vec<_> = covenants
         .iter()
         .map(|c| {
@@ -708,6 +709,7 @@ fn build_grid_snapshot(
         "tip_daa": tip.map(|t| t.0),
         "tip_at_ms": tip.map(|t| t.1),
         "processed_daa": store.processed_daa()?,
+        "stream_cursor": stream_cursor,
         "stats": stats_json(store)?,
         "covenants": rows,
     });
@@ -962,11 +964,13 @@ fn build_snapshot(
     }
 
     let tip = store.tip()?;
+    let stream_cursor = store.delivery_high_water()?;
     let snapshot = serde_json::json!({
         "network": network.to_string(),
         "generated_at_ms": now_ms(),
         "tip_daa": tip.map(|t| t.0),
         "tip_at_ms": tip.map(|t| t.1),
+        "stream_cursor": stream_cursor,
         "stats": stats_json(store)?,
         "covenants": exported,
     });
@@ -4958,6 +4962,10 @@ mod durable_events_tests {
 
         let discovery = stream_info_json(&store, Network::Testnet(10)).unwrap();
         assert_eq!(discovery["current"], second["current"]);
+        let grid = build_grid_snapshot(&store, Network::Testnet(10), None, Some(1)).unwrap();
+        assert_eq!(grid["stream_cursor"], second["current"]);
+        let snapshot = build_snapshot(&store, Network::Testnet(10), 1).unwrap();
+        assert_eq!(snapshot["stream_cursor"], second["current"]);
         assert!(discovery["history_start_daa"].is_u64());
         assert!(discovery["order_complete"].is_boolean());
         drop(store);

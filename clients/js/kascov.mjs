@@ -177,37 +177,73 @@ export class Kascov {
   /** Births/moves/burns per DAA bucket. range: 1h|6h|24h|48h|all */
   activity(range = '24h') { return this.#get(`/data/${this.network}/activity.json?range=${range}`); }
 
-  /** Open a native EventSource. The browser sends Last-Event-ID on automatic
-      reconnect. A reset closes the source so the caller can load a snapshot
-      before opening a new stream. */
+  /** Open a managed native EventSource subscription. The browser sends
+      Last-Event-ID on transport reconnects. A reset loads its snapshot and
+      opens a replacement source from the snapshot's stream_cursor. */
   stream(opts = {}) {
     const EventSourceClass = opts.EventSource || globalThis.EventSource;
     if (!EventSourceClass) throw new Error('kascov: EventSource is unavailable');
-    const q = new URLSearchParams();
-    for (const key of ['after', 'covenant', 'application', 'artifact', 'actor']) {
-      if (opts[key] != null) q.set(key, opts[key]);
+    const filters = {};
+    for (const key of ['covenant', 'application', 'artifact', 'actor']) {
+      if (opts[key] != null) filters[key] = opts[key];
 
     }
-    const suffix = q.toString();
-    const source = new EventSourceClass(
-      `${this.base}/data/${this.network}/stream${suffix ? `?${suffix}` : ''}`,
-    );
-    source.onopen = (event) => opts.onOpen?.(event);
-    source.onerror = (event) => opts.onError?.(event);
-    const deliver = (event) => {
-      try { opts.onMessage?.(JSON.parse(event.data), event); } catch { /* invalid data is ignored */ }
+    let source = null;
+    let closed = false;
+    let generation = 0;
+    const subscription = {
+      get source() { return source; },
+      close() {
+        closed = true;
+        generation += 1;
+        source?.close();
+        source = null;
+      },
     };
-    source.onmessage = deliver;
-    for (const kind of ['accepted', 'removed', 'projection_repaired', 'checkpoint']) {
-      source.addEventListener(kind, deliver);
-    }
-    source.addEventListener('reset', (event) => {
-      let reset = null;
-      try { reset = JSON.parse(event.data); } catch { /* malformed reset stays null */ }
-      source.close();
-      opts.onReset?.(reset, event);
-    });
-    return source;
+    const open = (after) => {
+      if (closed) return;
+      const q = new URLSearchParams(filters);
+      if (after != null) q.set('after', after);
+      const suffix = q.toString();
+      const candidate = new EventSourceClass(
+        `${this.base}/data/${this.network}/stream${suffix ? `?${suffix}` : ''}`,
+      );
+      source = candidate;
+      candidate.onopen = (event) => opts.onOpen?.(event);
+      candidate.onerror = (event) => opts.onError?.(event);
+      const deliver = (event) => {
+        if (source !== candidate) return;
+        try { opts.onMessage?.(JSON.parse(event.data), event); } catch { /* invalid data is ignored */ }
+      };
+      candidate.onmessage = deliver;
+      for (const kind of ['accepted', 'removed', 'projection_repaired', 'checkpoint']) {
+        candidate.addEventListener(kind, deliver);
+      }
+      candidate.addEventListener('reset', async (event) => {
+        if (closed || source !== candidate) return;
+        let reset = null;
+        try { reset = JSON.parse(event.data); } catch { /* validation below reports malformed data */ }
+        candidate.close();
+        source = null;
+        const resetGeneration = ++generation;
+        opts.onReset?.(reset, event);
+        try {
+          if (typeof reset?.snapshot !== 'string' || !reset.snapshot.startsWith('/')) {
+            throw new Error('kascov: reset has no snapshot endpoint');
+          }
+          const snapshot = await this.#get(reset.snapshot);
+          if (typeof snapshot.stream_cursor !== 'string' || snapshot.stream_cursor.length === 0) {
+            throw new Error('kascov: reset snapshot has no stream_cursor');
+          }
+          opts.onSnapshot?.(snapshot, reset);
+          if (!closed && generation === resetGeneration) open(snapshot.stream_cursor);
+        } catch (error) {
+          opts.onError?.(error);
+        }
+      });
+    };
+    open(opts.after);
+    return subscription;
   }
 }
 

@@ -246,12 +246,12 @@ class Kascov:
         """Durable SSE events. Reconnects with Last-Event-ID after the first response.
 
         Each result keeps the server payload and adds ``_event`` and ``_cursor``.
-        A ``reset`` result ends the iterator so the caller can reload a snapshot.
+        A ``reset`` result includes ``_snapshot``. The client then reopens from
+        that snapshot's ``stream_cursor``.
         """
-        q = {
+        filters = {
             key: value
             for key, value in {
-                "after": after,
                 "covenant": covenant,
                 "application": application,
                 "artifact": artifact,
@@ -259,10 +259,18 @@ class Kascov:
             }.items()
             if value is not None
         }
-        suffix = f"?{urllib.parse.urlencode(q)}" if q else ""
-        url = f"{self.base}/data/{self.network}/stream{suffix}"
+
+        def stream_url(start: Optional[str]) -> str:
+            query = dict(filters)
+            if start is not None:
+                query["after"] = start
+            suffix = f"?{urllib.parse.urlencode(query)}" if query else ""
+            return f"{self.base}/data/{self.network}/stream{suffix}"
+
+        url = stream_url(after)
         cursor: Optional[str] = None
         while True:
+            recovered_reset = False
             headers = {"accept": "text/event-stream", "user-agent": "kascov-py"}
             if cursor is not None:
                 headers["Last-Event-ID"] = cursor
@@ -284,9 +292,21 @@ class Kascov:
                                     cursor = event_id
                                 payload["_event"] = event_name
                                 payload["_cursor"] = event_id
+                                if event_name == "reset":
+                                    snapshot_path = payload.get("snapshot")
+                                    if not isinstance(snapshot_path, str) or not snapshot_path.startswith("/"):
+                                        raise ValueError("kascov: reset has no snapshot endpoint")
+                                    snapshot = self._get(snapshot_path)
+                                    snapshot_cursor = snapshot.get("stream_cursor")
+                                    if not isinstance(snapshot_cursor, str) or not snapshot_cursor:
+                                        raise ValueError("kascov: reset snapshot has no stream_cursor")
+                                    payload["_snapshot"] = snapshot
+                                    url = stream_url(snapshot_cursor)
+                                    cursor = None
+                                    recovered_reset = True
                                 yield payload
                                 if event_name == "reset":
-                                    return
+                                    break
                         event_name, event_id, data = "message", None, []
                     elif line.startswith("event:"):
                         event_name = line[6:].strip()
@@ -294,6 +314,8 @@ class Kascov:
                         event_id = line[3:].strip()
                     elif line.startswith("data:"):
                         data.append(line[5:].lstrip())
+            if recovered_reset:
+                continue
             if not reconnect:
                 return
 

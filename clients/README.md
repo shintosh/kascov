@@ -2,7 +2,7 @@
 
 Tiny, zero-dependency wrappers over the [kascov JSON API](https://kascov.io/#/dev) — CORS-open, no keys.
 
-- **`js/kascov.mjs`** — Node 18+ / browser, native fetch, SSE via async iterator.
+- **`js/kascov.mjs`** — Node 18+ / browser, native fetch, managed EventSource subscription.
 - **`py/kascov.py`** — Python 3.9+, stdlib urllib only.
 
 Both cover: live feed, paginated coin summaries, per-coin detail, tx/address
@@ -29,8 +29,12 @@ All amounts remain exact JSON integers. Market prices remain exact
 `quote_sompi / base_amount` pairs, and vesting coordinates are DAA scores rather
 than timestamps.
 
-The stream is `GET /data/{network}/stream` — the same route the worker registers
-and the site itself uses. An optional per-covenant filter narrows it to one coin:
+Durable events are `accepted`, `removed`, `projection_repaired`, and
+`checkpoint`. Pending hints do not have durable IDs. A `reset` has no ID. Both
+clients load the named snapshot and reopen from its `stream_cursor`. JavaScript
+calls `onSnapshot`; Python adds the loaded snapshot as `_snapshot` on the reset
+result.
+
 
 ```js
 for await (const ev of k.stream({ covenant: id })) ...   // js
