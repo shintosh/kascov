@@ -580,6 +580,23 @@ fn capacity_response(
         .into_response()
 }
 
+fn reset_only_stream(
+    slot: SubscriberSlot,
+    reset: axum::response::sse::Event,
+    deadline: tokio::time::Instant,
+) -> impl futures::Stream<
+    Item = std::result::Result<axum::response::sse::Event, std::convert::Infallible>,
+> + Send {
+    drop(slot);
+    futures::stream::once(async { Ok(reset) }).chain(futures::stream::unfold(
+        (),
+        move |_| async move {
+            tokio::time::sleep_until(deadline).await;
+            None
+        },
+    ))
+}
+
 /// Replay durable delivery records, then hand off without gaps to the
 /// post-commit hub. Pending frames remain best-effort and carry no cursor.
 pub(super) async fn stream_handler(
@@ -660,18 +677,7 @@ pub(super) async fn stream_handler(
                 "snapshot": format!("/data/{network}.json"),
             }))
             .expect("reset JSON is serializable");
-        let tail = futures::stream::unfold(slot, move |slot| async move {
-            tokio::time::sleep_until(deadline).await;
-            drop(slot);
-            None::<(
-                std::result::Result<Event, std::convert::Infallible>,
-                SubscriberSlot,
-            )>
-        });
-        let stream = futures::stream::once(async {
-            Ok::<_, std::convert::Infallible>(reset)
-        })
-        .chain(tail);
+        let stream = reset_only_stream(slot, reset, deadline);
         let mut response = Sse::new(stream)
             .keep_alive(
                 KeepAlive::new()
@@ -811,6 +817,22 @@ mod tests {
         let slot = hub.try_subscribe().unwrap();
         assert!(hub.try_subscribe().is_none());
         drop(slot);
+        assert!(hub.try_subscribe().is_some());
+    }
+
+    #[test]
+    fn reset_only_heartbeat_releases_accepted_stream_capacity() {
+        let hub = DeliveryHub::new(CapacityLimits {
+            max_streams: 1,
+            ..test_limits()
+        });
+        let slot = hub.try_subscribe().unwrap();
+        let _reset_stream = reset_only_stream(
+            slot,
+            axum::response::sse::Event::default().event("reset").data("{}"),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
         assert!(hub.try_subscribe().is_some());
     }
 
