@@ -390,7 +390,6 @@ const MAX_ARGENT_MANIFEST_REJECTIONS: usize = 20;
 struct ArgentManifestRejectionHealth {
     application_id: String,
     code: String,
-    detail: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -426,7 +425,6 @@ impl ArgentManifestHealth {
                 .map(|rejection| ArgentManifestRejectionHealth {
                     application_id: rejection.application_id.clone(),
                     code: rejection.code.clone(),
-                    detail: rejection.detail.clone(),
                 })
                 .collect(),
         }
@@ -479,12 +477,12 @@ mod argent_manifest_health_tests {
     use super::*;
 
     #[test]
-    fn diagnostics_keep_counts_and_bound_rejection_details() {
+    fn diagnostics_keep_counts_without_exposing_rejection_details() {
         let rejections: Vec<_> = (0..25)
             .map(|index| kascov_argent::ManifestRejection {
                 application_id: format!("app-{index}"),
                 code: "artifact_hash_mismatch".into(),
-                detail: "artifact digest differs".into(),
+                detail: "/private/manifests/app.ag differs from expected digest".into(),
             })
             .collect();
 
@@ -494,6 +492,8 @@ mod argent_manifest_health_tests {
         assert_eq!(2, json["approved"]);
         assert_eq!(25, json["rejected"]);
         assert_eq!(20, json["rejections"].as_array().unwrap().len());
+        assert!(json["rejections"][0].get("detail").is_none());
+        assert!(!json.to_string().contains("/private/manifests"));
     }
 }
 
@@ -2427,6 +2427,7 @@ async fn healthz_handler(
                     store.processed_daa()?,
                     store.tip()?.map(|t| t.0),
                     store.tx_index_backfill_done()?,
+                    store.application_decode_failure_counts()?,
                 ))
             }))
             .await
@@ -2435,7 +2436,12 @@ async fn healthz_handler(
         } else {
             None
         };
-        let (processed, tip, backfill_done) = indexed.unwrap_or((None, None, false));
+        let (processed, tip, backfill_done, decode_failures) = indexed.unwrap_or((
+            None,
+            None,
+            false,
+            kascov_core::store_application::ApplicationDecodeFailureCounts::default(),
+        ));
         let lag = tip.zip(processed).map(|(t, p)| t.saturating_sub(p));
         let mut performance = state
             .performance
@@ -2480,6 +2486,7 @@ async fn healthz_handler(
                 "last_progress_ms": last_progress,
                 "delivery_high_water": delivery_high_water,
                 "tx_index_backfill_done": backfill_done,
+                "argent_decode_failures": decode_failures,
                 "mempool": mempool,
                 "capacity": capacity,
                 "tuning": state.tuning.health_json(),

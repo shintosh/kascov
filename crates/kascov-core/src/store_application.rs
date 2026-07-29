@@ -229,6 +229,12 @@ pub struct ApplicationRepairResult {
     pub failures_remaining: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ApplicationDecodeFailureCounts {
+    pub total: u64,
+    pub unrepaired: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ApplicationTransactionResult {
     pub txid: TxId,
@@ -444,6 +450,23 @@ impl Store {
 
     pub fn decode_failures(&self, limit: u64) -> Result<Vec<StoredDecodeFailure>> {
         self.application_decode_failures_page(None, 0, limit)
+    }
+
+    pub fn application_decode_failure_counts(&self) -> Result<ApplicationDecodeFailureCounts> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(*) FILTER (WHERE repaired_stream_seq IS NULL)
+                 FROM application_decode_failures",
+                [],
+                |row| {
+                    Ok(ApplicationDecodeFailureCounts {
+                        total: row.get(0)?,
+                        unrepaired: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(db_err)
     }
 
     pub fn application_decode_failures_page(
@@ -761,7 +784,7 @@ fn db_err(error: rusqlite::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::ApplicationRepairResult;
+    use super::{ApplicationDecodeFailureCounts, ApplicationRepairResult};
     use crate::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent, NewUtxo, Store};
     use crate::{
         ApplicationDecoder, ApplicationOutput, ApplicationPreprocess, BlockHash,
@@ -857,6 +880,27 @@ mod tests {
         let failures = store.decode_failures(10).unwrap();
         assert_eq!(1, failures.len());
         assert_eq!("state", failures[0].failure.code);
+        assert_eq!(
+            ApplicationDecodeFailureCounts {
+                total: 1,
+                unrepaired: 1,
+            },
+            store.application_decode_failure_counts().unwrap()
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE application_decode_failures SET repaired_stream_seq = 7",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            ApplicationDecodeFailureCounts {
+                total: 1,
+                unrepaired: 0,
+            },
+            store.application_decode_failure_counts().unwrap()
+        );
         assert_eq!(
             1,
             store
