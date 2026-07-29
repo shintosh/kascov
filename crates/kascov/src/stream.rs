@@ -821,7 +821,10 @@ mod tests {
         let capacity = hub.capacity_json(limits);
         assert_eq!(Some(512), capacity["max_streams"].as_u64());
         assert_eq!(Some(32), capacity["max_historical_replays"].as_u64());
-        assert_eq!(Some(512), capacity["replay_page_records"].as_u64());
+        assert_eq!(
+            Some(DEFAULT_REPLAY_PAGE_SIZE),
+            capacity["replay_page_records"].as_u64()
+        );
         assert_eq!(Some(1_000), capacity["event_page_records"].as_u64());
 
         let response = capacity_response(axum::http::StatusCode::TOO_MANY_REQUESTS, "busy");
@@ -1112,7 +1115,7 @@ mod tests {
             },
         );
 
-        for expected in [512, 600] {
+        for expected in [256, 512, 600] {
             let (frame, next) = next_stream_frame(state).await.unwrap();
             state = next;
             assert!(matches!(frame, StreamFrame::Checkpoint(cursor) if cursor.seq == expected));
