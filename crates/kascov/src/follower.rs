@@ -1,5 +1,68 @@
 use super::*;
 
+const WRITER_MUTATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+type WriterOperation = Box<dyn FnOnce(&mut Store) + Send + 'static>;
+
+pub(super) struct WriterMutation(WriterOperation);
+
+impl WriterMutation {
+    fn apply(self, store: &mut Store) {
+        (self.0)(store);
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct WriterHandle {
+    tx: tokio::sync::mpsc::Sender<WriterMutation>,
+}
+
+impl WriterHandle {
+    pub(super) async fn mutate<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
+    {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .try_send(WriterMutation(Box::new(move |store| {
+                let _ = result_tx.send(operation(store));
+            })))
+            .map_err(|err| anyhow::anyhow!("canonical writer unavailable: {err}"))?;
+        tokio::time::timeout(WRITER_MUTATION_TIMEOUT, result_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("canonical writer mutation timed out"))?
+            .map_err(|_| anyhow::anyhow!("canonical writer stopped before mutation completed"))?
+    }
+}
+
+pub(super) fn writer_channel(
+    capacity: usize,
+) -> (WriterHandle, tokio::sync::mpsc::Receiver<WriterMutation>) {
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity);
+    (WriterHandle { tx }, rx)
+}
+
+async fn await_with_mutations<F>(
+    future: F,
+    mutations: &mut tokio::sync::mpsc::Receiver<WriterMutation>,
+    store: &mut Store,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return output,
+            mutation = mutations.recv() => match mutation {
+                Some(mutation) => mutation.apply(store),
+                None => return future.await,
+            },
+        }
+    }
+}
+
 /// Per-network follower liveness, shared with /healthz. Epoch ms; both fields
 /// initialized to boot time so a fresh instance gets the same 10-minute grace
 /// as a healthy one.
@@ -19,6 +82,33 @@ pub(super) struct SyncHealth {
     pub(super) last_progress_ms: std::sync::atomic::AtomicI64,
     /// Highest durable accepted delivery sequence published by this process.
     pub(super) delivery_high_water: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+mod writer_mutation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_mutation_uses_the_existing_writer_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer.db");
+        let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let (writer, mut mutations) = writer_channel(1);
+
+        let requested = tokio::spawn(async move {
+            writer
+                .mutate(|store| {
+                    store.put_verified_source("hash", "00", "source", "", None, 1)?;
+                    Ok(store.get_verified_source("hash")?.is_some())
+                })
+                .await
+        });
+        let mutation = mutations.recv().await.unwrap();
+        mutation.apply(&mut store);
+
+        assert!(requested.await.unwrap().unwrap());
+        assert!(Store::open(&path, Network::Testnet(10)).is_err());
+    }
 }
 
 /// After repeated sync failures — or passes that succeed without advancing —
@@ -107,6 +197,7 @@ pub(super) async fn follow_forever(
     decoder: std::sync::Arc<dyn kascov_core::ApplicationDecoder>,
     health: std::sync::Arc<SyncHealth>,
     performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
+    mut writer_mutations: tokio::sync::mpsc::Receiver<WriterMutation>,
 ) {
     use kascov_core::sync::SyncUpdate;
     // Per-network node override: KASCOV_RPC_TESTNET_10 / KASCOV_RPC_MAINNET.
@@ -169,11 +260,22 @@ pub(super) async fn follow_forever(
                 "{network}: token derivation failed ({err}) — will retry next session"
             ),
         }
-        let node = match NodeHandle::connect(network, rpc.as_deref()).await {
+        let node = match await_with_mutations(
+            NodeHandle::connect(network, rpc.as_deref()),
+            &mut writer_mutations,
+            &mut store,
+        )
+        .await
+        {
             Ok(node) => node,
             Err(err) => {
                 tracing::warn!("{network}: connect failed ({err}), retrying in 10s");
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                await_with_mutations(
+                    tokio::time::sleep(std::time::Duration::from_secs(10)),
+                    &mut writer_mutations,
+                    &mut store,
+                )
+                .await;
                 continue;
             }
         };
@@ -200,7 +302,8 @@ pub(super) async fn follow_forever(
         let mut schedule =
             performance::ReconcileSchedule::new(node.wakeups(), RECONCILIATION_WATCHDOG);
         'connected: loop {
-            let mut trigger = schedule.next().await;
+            let mut trigger =
+                await_with_mutations(schedule.next(), &mut writer_mutations, &mut store).await;
             if let performance::ReconcileTrigger::Disconnected { .. } = trigger {
                 break;
             }

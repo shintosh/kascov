@@ -25,7 +25,7 @@ use kascov_core::node::NodeHandle;
 use kascov_core::store::{ClaimedTokenMeta, Store};
 use kascov_core::{BlockHash, CovenantId, Network, TxId};
 
-use follower::{follow_forever, recover_wedged_cursor, SyncHealth};
+use follower::{follow_forever, recover_wedged_cursor, writer_channel, SyncHealth, WriterHandle};
 use pending::{pending_handler, poll_mempool_forever, PendingFeed};
 use stream::{stream_handler, DeliveryHub, PendingHub};
 
@@ -1625,6 +1625,8 @@ struct ServeState {
     networks: Vec<Network>,
     /// One bounded, read-only SQLite pool per followed network.
     read_pools: Vec<(Network, read_pool::ReadPool)>,
+    /// The one bounded mutation route to each network's canonical writer.
+    writers: Vec<(Network, WriterHandle)>,
     max_events: u64,
     capacity: stream::CapacityLimits,
     tuning: tuning::TuningProfile,
@@ -1846,6 +1848,15 @@ fn read_pool_for(state: &ServeState, network: Network) -> read_pool::ReadPool {
         .expect("every configured network has a read pool")
 }
 
+fn writer_for(state: &ServeState, network: Network) -> WriterHandle {
+    state
+        .writers
+        .iter()
+        .find(|(candidate, _)| *candidate == network)
+        .map(|(_, writer)| writer.clone())
+        .expect("every configured network has a canonical writer")
+}
+
 fn read_unavailable(message: &'static str) -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -1925,6 +1936,7 @@ async fn serve(
     let mut pending = Vec::with_capacity(networks.len());
     let mut network_performance = Vec::with_capacity(networks.len());
     let mut read_pools = Vec::with_capacity(networks.len());
+    let mut writers = Vec::with_capacity(networks.len());
     for &network in &networks {
         let delivery_hub = DeliveryHub::new(capacity);
         let pending_hub = PendingHub::new();
@@ -1946,10 +1958,16 @@ async fn serve(
         // The pending poller opens its OWN read-only handle on the same file,
         // so hand it a separate path (the follower moves `db` below).
         let db_for_poller = db.clone();
+        let (writer, writer_mutations) = writer_channel(128);
         // Webhook delivery rides the same event callback as SSE: the follower
         // try_sends into this queue and a per-network task does the POSTs.
         let (hook_tx, hook_rx) = tokio::sync::mpsc::channel::<HookEvent>(HOOK_QUEUE);
-        tokio::spawn(webhook_delivery_forever(network, db.clone(), hook_rx));
+        tokio::spawn(webhook_delivery_forever(
+            network,
+            db.clone(),
+            hook_rx,
+            writer.clone(),
+        ));
         // Witnessed launchpad logos: a background pinner, so a page view never
         // triggers an outbound fetch to a host a third-party list chose.
         tokio::spawn(witness_forever(network, base_dir.clone()));
@@ -1964,6 +1982,7 @@ async fn serve(
             decoder.clone(),
             health.clone(),
             metrics.clone(),
+            writer_mutations,
         ));
         // Live pending (mempool) covenant feed: an additive, isolated poller
         // that reads the same node the follower confirms against and keeps its
@@ -1981,6 +2000,7 @@ async fn serve(
         sync_health.push((network, health));
         pending.push((network, pending_set));
         network_performance.push((network, metrics));
+        writers.push((network, writer));
     }
 
     let consistency = networks
@@ -1991,6 +2011,7 @@ async fn serve(
         base_dir,
         networks,
         read_pools,
+        writers,
         max_events,
         capacity,
         tuning,
@@ -2555,6 +2576,7 @@ async fn webhook_delivery_forever(
     network: Network,
     db: std::path::PathBuf,
     mut rx: tokio::sync::mpsc::Receiver<HookEvent>,
+    writer: WriterHandle,
 ) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -2627,15 +2649,12 @@ async fn webhook_delivery_forever(
             *n += 1;
             if *n >= WEBHOOK_MAX_FAILURES {
                 failures.remove(&id);
-                let db = db.clone();
-                let deleted = tokio::task::spawn_blocking(move || -> Result<bool> {
-                    let store = Store::open(&db, network)?;
-                    Ok(store.delete_subscription(id)?)
-                })
-                .await;
+                let deleted = writer
+                    .mutate(move |store| Ok(store.delete_subscription(id)?))
+                    .await;
                 tracing::warn!(
                     "{network}: webhook subscription {id} ({url}) removed after {WEBHOOK_MAX_FAILURES} consecutive failures (deleted: {})",
-                    matches!(deleted, Ok(Ok(true)))
+                    matches!(deleted, Ok(true))
                 );
             }
         }
@@ -7635,19 +7654,25 @@ async fn publish_handler(
     let hash = hex::encode(blake2b32(&bytes));
     let decoded = kascov_decode::Registry::default().decode(0, &bytes);
     let template = decoded.template.map(|t| t.to_string());
-    let db = state.base_dir.join(format!("{network}.db"));
+    let writer = writer_for(&state, network);
     let (source, args) = (req.source, req.args.join("\n"));
     let (hash2, tmpl2) = (hash.clone(), template.clone());
-    let stored = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        store.put_verified_source(&hash2, &hex, &source, &args, tmpl2.as_deref(), now_ms())?;
-        Ok(())
-    })
-    .await;
+    let stored = writer
+        .mutate(move |store| {
+            store.put_verified_source(
+                &hash2,
+                &hex,
+                &source,
+                &args,
+                tmpl2.as_deref(),
+                now_ms(),
+            )?;
+            Ok(())
+        })
+        .await;
     match stored {
-        Ok(Ok(())) => {
-            json_resp(serde_json::json!({ "ok": true, "hash": hash, "template": template }))
-        }
+        Ok(()) => json_resp(serde_json::json!({ "ok": true, "hash": hash, "template": template })),
+
         _ => json_resp(serde_json::json!({ "ok": false, "error": "couldn't store the source" })),
     }
 }
@@ -7737,21 +7762,22 @@ async fn subscribe_handler(
         secp256k1::rand::rngs::OsRng.fill_bytes(&mut buf);
         hex::encode(buf)
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let writer = writer_for(&state, network);
     let (kind, url, stored_secret) = (req.kind, req.url, secret.clone());
-    let added = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        Ok(store.add_subscription(
-            cid.as_deref(),
-            kind.as_deref(),
-            &url,
-            Some(&stored_secret),
-            now_ms(),
-        )?)
-    })
-    .await;
+    let added = writer
+        .mutate(move |store| {
+            Ok(store.add_subscription(
+                cid.as_deref(),
+                kind.as_deref(),
+                &url,
+                Some(&stored_secret),
+                now_ms(),
+            )?)
+        })
+        .await;
+
     match added {
-        Ok(Ok(id)) => json_resp(serde_json::json!({ "ok": true, "id": id, "secret": secret })),
+        Ok(id) => json_resp(serde_json::json!({ "ok": true, "id": id, "secret": secret })),
         _ => json_resp(serde_json::json!({ "ok": false, "error": "couldn't subscribe" })),
     }
 }
@@ -7776,20 +7802,17 @@ async fn unsubscribe_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
-    let deleted = tokio::task::spawn_blocking(move || -> Result<UnsubscribeOutcome> {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        Ok(store.delete_subscription_secured(req.id, req.secret.as_deref())?)
-    })
-    .await;
+    let writer = writer_for(&state, network);
+    let deleted = writer
+        .mutate(move |store| {
+            Ok(store.delete_subscription_secured(req.id, req.secret.as_deref())?)
+        })
+        .await;
     match deleted {
-        Ok(Ok(UnsubscribeOutcome::Deleted)) => {
-            json_resp(serde_json::json!({ "ok": true, "deleted": true }))
-        }
-        Ok(Ok(UnsubscribeOutcome::NotFound)) => {
-            json_resp(serde_json::json!({ "ok": true, "deleted": false }))
-        }
-        Ok(Ok(UnsubscribeOutcome::WrongSecret)) => json_error(
+        Ok(UnsubscribeOutcome::Deleted) => json_resp(serde_json::json!({ "ok": true, "deleted": true })),
+        Ok(UnsubscribeOutcome::NotFound) => json_resp(serde_json::json!({ "ok": true, "deleted": false })),
+        Ok(UnsubscribeOutcome::WrongSecret) => json_error(
+
             axum::http::StatusCode::FORBIDDEN,
             serde_json::json!({ "ok": false, "error": "secret does not match" }),
         ),
@@ -8680,7 +8703,7 @@ async fn token_image_handler(
         return (StatusCode::BAD_REQUEST, "bad covenant id").into_response();
     };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let writer = writer_for(&state, network);
     let read_pool = read_pool_for(&state, network);
     // 1. cache + claim lookup (blocking store work off the runtime workers)
     let lookup = tokio::task::spawn_blocking(move || read_pool.query(|store| {
@@ -8747,20 +8770,20 @@ async fn token_image_handler(
         .await
         .unwrap_or(Err("ssrf guard panicked"));
     let record = |status: &'static str, ct: Option<String>, body: Option<Vec<u8>>| {
-        let db = db.clone();
+        let writer = writer.clone();
         async move {
-            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-                let store = kascov_core::store::Store::open(&db, network)?;
-                store.put_token_image(
-                    &covenant_id,
-                    status,
-                    ct.as_deref(),
-                    body.as_deref(),
-                    now_ms(),
-                )?;
-                Ok(())
-            })
-            .await;
+            let _ = writer
+                .mutate(move |store| {
+                    store.put_token_image(
+                        &covenant_id,
+                        status,
+                        ct.as_deref(),
+                        body.as_deref(),
+                        now_ms(),
+                    )?;
+                    Ok(())
+                })
+                .await;
         }
     };
     if allowed.is_err() {
