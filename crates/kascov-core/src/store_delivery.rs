@@ -1069,6 +1069,17 @@ mod tests {
         let _ = std::fs::remove_file(&backup);
         let writer = Store::open(&source, Network::Testnet(10)).unwrap();
 
+        assert!(Store::backup_database(&source, Network::Testnet(10), &source).is_err());
+        let wal = std::path::PathBuf::from(format!("{}-wal", source.display()));
+        let shm = std::path::PathBuf::from(format!("{}-shm", source.display()));
+        assert!(Store::backup_database(&source, Network::Testnet(10), &wal).is_err());
+        assert!(Store::backup_database(&source, Network::Testnet(10), &shm).is_err());
+        let hard_link = base.with_extension("hard-link.db");
+        let _ = std::fs::remove_file(&hard_link);
+        std::fs::hard_link(&source, &hard_link).unwrap();
+        assert!(Store::backup_database(&source, Network::Testnet(10), &hard_link).is_err());
+        std::fs::remove_file(&hard_link).unwrap();
+
         Store::backup_database(&source, Network::Testnet(10), &backup).unwrap();
 
         let restored = Store::open_reader(&backup, Network::Testnet(10)).unwrap();

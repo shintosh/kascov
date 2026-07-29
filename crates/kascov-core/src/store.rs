@@ -1251,7 +1251,94 @@ const KCC1_ABI_VERSION: &str = "55b28d8";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FreshDb {
     Allow,
-    Refuse,
+    Refuse,}
+
+fn backup_path_error(error: std::io::Error) -> Error {
+    Error::Invalid {
+        what: "backup path",
+        value: error.to_string(),
+    }
+}
+
+fn normalized_backup_path(path: &Path) -> Result<std::path::PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(backup_path_error)?
+            .join(path)
+    };
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let name = absolute.file_name().ok_or_else(|| Error::Invalid {
+        what: "backup path",
+        value: path.display().to_string(),
+    })?;
+    Ok(parent.join(name))
+}
+
+fn validate_backup_target(source: &Path, out: &Path) -> Result<()> {
+    let source = std::fs::canonicalize(source).map_err(backup_path_error)?;
+    let out_normalized = normalized_backup_path(out)?;
+    let mut wal = source.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = source.as_os_str().to_os_string();
+    shm.push("-shm");
+    if out_normalized == source
+        || out_normalized == Path::new(&wal)
+        || out_normalized == Path::new(&shm)
+        || (out.exists() && same_file::is_same_file(&source, out).map_err(backup_path_error)?)
+    {
+        return Err(Error::Invalid {
+            what: "backup path",
+            value: "destination aliases the live database or a SQLite sidecar".into(),
+        });
+    }
+    Ok(())
+}
+
+fn backup_temporary_path(out: &Path) -> Result<std::path::PathBuf> {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = out.parent().unwrap_or_else(|| Path::new("."));
+    let name = out.file_name().ok_or_else(|| Error::Invalid {
+        what: "backup path",
+        value: out.display().to_string(),
+    })?;
+    for _ in 0..100 {
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{}.backup-{}-{nonce}",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(backup_path_error(error)),
+        }
+    }
+    Err(Error::Invalid {
+        what: "backup path",
+        value: "could not allocate a temporary backup file".into(),
+    })
+}
+
+struct BackupTemporary(Option<std::path::PathBuf>);
+
+impl Drop for BackupTemporary {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
 }
 
 impl Store {
@@ -1720,17 +1807,40 @@ impl Store {
 
     /// Write a consistent copy of the database (safe while a writer is active).
     pub fn backup_to(&self, out: &Path) -> Result<()> {
-        if out.exists() {
-            std::fs::remove_file(out).map_err(|e| Error::Invalid {
-                what: "backup path",
-                value: e.to_string(),
-            })?;
-        }
-        let mut destination = Connection::open(out).map_err(db_err)?;
-        let backup = rusqlite::backup::Backup::new(&self.conn, &mut destination).map_err(db_err)?;
-        backup
-            .run_to_completion(256, std::time::Duration::from_millis(10), None)
+        let source: String = self
+            .conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+
             .map_err(db_err)?;
+        validate_backup_target(Path::new(&source), out)?;
+        let parent = out.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(backup_path_error)?;
+        let temporary = backup_temporary_path(out)?;
+        let mut cleanup = BackupTemporary(Some(temporary.clone()));
+        let mut destination = Connection::open(&temporary).map_err(db_err)?;
+        {
+            let backup =
+                rusqlite::backup::Backup::new(&self.conn, &mut destination).map_err(db_err)?;
+            backup
+                .run_to_completion(256, std::time::Duration::from_millis(10), None)
+                .map_err(db_err)?;
+        }
+        let check: String = destination
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(db_err)?;
+        if check != "ok" {
+            return Err(Error::Invalid {
+                what: "backup validation",
+                value: check,
+            });
+        }
+        drop(destination);
+        std::fs::rename(&temporary, out).map_err(backup_path_error)?;
+        cleanup.0 = None;
         Ok(())
     }
 
