@@ -74,13 +74,6 @@ CREATE TABLE IF NOT EXISTS application_decode_failure_counts (
     total INTEGER NOT NULL CHECK (total >= 0),
     unrepaired INTEGER NOT NULL CHECK (unrepaired >= 0)
 );
-INSERT INTO application_decode_failure_counts (singleton, total, unrepaired)
-SELECT 1, COUNT(*),
-       COALESCE(SUM(CASE WHEN repaired_stream_seq IS NULL THEN 1 ELSE 0 END), 0)
-FROM application_decode_failures WHERE true
-ON CONFLICT(singleton) DO UPDATE SET
-    total = excluded.total,
-    unrepaired = excluded.unrepaired;
 CREATE TRIGGER IF NOT EXISTS application_failure_count_insert
 AFTER INSERT ON application_decode_failures
 BEGIN
@@ -120,6 +113,7 @@ const APPLICATION_DECODE_FAILURE_COUNTS_QUERY: &str =
 
 pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(APPLICATION_SCHEMA).map_err(db_err)?;
+    seed_application_decode_failure_counts(conn)?;
     match conn.execute(
         "ALTER TABLE application_envelopes ADD COLUMN transaction_json TEXT",
         [],
@@ -133,6 +127,30 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         }
         Err(error) => Err(db_err(error)),
     }
+}
+
+fn seed_application_decode_failure_counts(conn: &Connection) -> Result<bool> {
+    let seeded = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM application_decode_failure_counts WHERE singleton = 1
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_err)?;
+    if seeded {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO application_decode_failure_counts (singleton, total, unrepaired)
+         SELECT 1, COUNT(*),
+                COALESCE(SUM(CASE WHEN repaired_stream_seq IS NULL THEN 1 ELSE 0 END), 0)
+         FROM application_decode_failures",
+        [],
+    )
+    .map_err(db_err)?;
+    Ok(true)
 }
 
 pub(crate) fn apply_accepted(
@@ -835,7 +853,7 @@ fn db_err(error: rusqlite::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationDecodeFailureCounts, ApplicationRepairResult,
+        seed_application_decode_failure_counts, ApplicationDecodeFailureCounts, ApplicationRepairResult,
         APPLICATION_DECODE_FAILURE_COUNTS_QUERY,
     };
     use crate::store::{AcceptedBlockBatch, AcceptedTransaction, EventKind, NewEvent, NewUtxo, Store};
@@ -898,6 +916,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(1, count_table);
+        assert!(!seed_application_decode_failure_counts(&store.conn).unwrap());
         assert_eq!(
             ApplicationDecodeFailureCounts::default(),
             store.application_decode_failure_counts().unwrap()
@@ -956,6 +975,39 @@ mod tests {
         assert!(plan
             .iter()
             .all(|detail| !detail.contains("application_decode_failures")));
+    }
+
+    #[test]
+    fn failure_count_migration_seeds_existing_rows_once() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-application-counter-migration-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path, Network::Testnet(10)).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TRIGGER application_failure_count_insert;
+                 DROP TRIGGER application_failure_count_delete;
+                 DROP TRIGGER application_failure_count_repair;
+                 DROP TABLE application_decode_failure_counts;
+                 INSERT INTO application_decode_failures (
+                    txid, accepting_block, accepting_daa, code, detail
+                 ) VALUES (zeroblob(32), zeroblob(32), 1, 'state', 'invalid');",
+            )
+            .unwrap();
+
+        super::migrate(&store.conn).unwrap();
+
+        assert_eq!(
+            ApplicationDecodeFailureCounts {
+                total: 1,
+                unrepaired: 1,
+            },
+            store.application_decode_failure_counts().unwrap()
+        );
+        assert!(!seed_application_decode_failure_counts(&store.conn).unwrap());
     }
 
     #[test]
