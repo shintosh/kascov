@@ -1261,11 +1261,22 @@ fn backup_path_error(error: std::io::Error) -> Error {
 }
 
 fn resolved_database_path(path: &Path) -> Result<std::path::PathBuf> {
-    if path.exists() {
-        return std::fs::canonicalize(path).map_err(|error| Error::Invalid {
-            what: "db path",
-            value: error.to_string(),
-        });
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            let resolved = std::fs::canonicalize(path).map_err(|error| Error::Invalid {
+                what: "db path",
+                value: error.to_string(),
+            })?;
+            reject_database_hard_links(&resolved)?;
+            return Ok(resolved);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::Invalid {
+                what: "db path",
+                value: error.to_string(),
+            });
+        }
     }
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1287,6 +1298,26 @@ fn resolved_database_path(path: &Path) -> Result<std::path::PathBuf> {
         value: path.display().to_string(),
     })?;
     Ok(parent.join(name))
+}
+
+fn reject_database_hard_links(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let links = std::fs::metadata(path)
+            .map_err(|error| Error::Invalid {
+                what: "db path",
+                value: error.to_string(),
+            })?
+            .nlink();
+        if links > 1 {
+            return Err(Error::Invalid {
+                what: "db path",
+                value: "hard-linked database files are not supported".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn resolved_backup_path(path: &Path) -> Result<std::path::PathBuf> {
