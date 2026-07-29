@@ -291,22 +291,6 @@ impl PendingFeed {
 /// Atomically admit every covenant event for one mempool transaction. The
 /// capacity gate is checked once at tx granularity: callers can safely decide
 /// whether an SSE hint will have an authoritative row that can later resolve.
-fn track_pending_transaction(
-    feed: &mut PendingFeed,
-    tx: &kascov_core::Transaction,
-    events: Vec<kascov_core::sync::PendingTxEvent>,
-    application: kascov_core::ApplicationPreprocess,
-) -> PendingInsert {
-    track_pending_transaction_at(
-        feed,
-        tx,
-        events,
-        application,
-        now_ms(),
-        std::time::Instant::now(),
-    )
-}
-
 fn track_pending_transaction_at(
     feed: &mut PendingFeed,
     tx: &kascov_core::Transaction,
@@ -478,7 +462,7 @@ fn replacement_for(
 
 pub(super) async fn resolve_accepted_pending(
     pending: &std::sync::Arc<tokio::sync::Mutex<PendingFeed>>,
-    live_tx: &tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    live_tx: &tokio::sync::broadcast::Sender<std::sync::Arc<crate::stream::PendingBroadcast>>,
     accepted_txids: &HashSet<TxId>,
 ) -> usize {
     let mut resolved = Vec::new();
@@ -496,7 +480,9 @@ pub(super) async fn resolve_accepted_pending(
             if let Some(message) =
                 pending_resolved_sse_json(&txid, &entry, "accepted", None, revision)
             {
-                let _ = live_tx.send(message.to_string().into());
+                let _ = live_tx.send(std::sync::Arc::new(
+                    crate::stream::PendingBroadcast::new(message.to_string(), now_ms()),
+                ));
             }
         }
     }
@@ -526,7 +512,7 @@ pub(super) async fn poll_mempool_forever(
     network: Network,
     rpc: Option<String>,
     db: std::path::PathBuf,
-    live_tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    live_tx: tokio::sync::broadcast::Sender<std::sync::Arc<crate::stream::PendingBroadcast>>,
     pending: std::sync::Arc<tokio::sync::Mutex<PendingFeed>>,
     decoder: std::sync::Arc<dyn kascov_core::ApplicationDecoder>,
 ) {
@@ -597,6 +583,7 @@ pub(super) async fn poll_mempool_forever(
                     break;
                 }
             };
+            let observed_at_ms = now_ms();
             let cur_ids: HashSet<TxId> = txs.iter().map(|tx| tx.txid).collect();
             let current_spenders: std::collections::HashMap<kascov_core::Outpoint, TxId> = txs
                 .iter()
@@ -633,7 +620,14 @@ pub(super) async fn poll_mempool_forever(
                 let application = decoder.preprocess(tx);
                 let (admission, messages) = {
                     let mut feed = pending.lock().await;
-                    let admission = track_pending_transaction(&mut feed, tx, events, application);
+                    let admission = track_pending_transaction_at(
+                        &mut feed,
+                        tx,
+                        events,
+                        application,
+                        observed_at_ms,
+                        std::time::Instant::now(),
+                    );
                     let messages = if admission.tracked() {
                         pending_sse_jsons(&feed, &tx.txid)
                             .into_iter()
@@ -657,7 +651,9 @@ pub(super) async fn poll_mempool_forever(
                 }
                 if live_tx.receiver_count() > 0 {
                     for msg in messages {
-                        let _ = live_tx.send(msg.into());
+                        let _ = live_tx.send(std::sync::Arc::new(
+                            crate::stream::PendingBroadcast::new(msg, observed_at_ms),
+                        ));
                     }
                 }
             }
@@ -740,7 +736,9 @@ pub(super) async fn poll_mempool_forever(
                     if let Some(msg) =
                         pending_resolved_sse_json(&txid, &entry, resolution, replaced_by, revision)
                     {
-                        let _ = live_tx.send(msg.to_string().into());
+                        let _ = live_tx.send(std::sync::Arc::new(
+                            crate::stream::PendingBroadcast::new(msg.to_string(), now_ms()),
+                        ));
                     }
                 }
             }
@@ -1129,8 +1127,8 @@ mod pending_feed_tests {
             1,
             resolve_accepted_pending(&pending, &live_tx, &HashSet::from([txid])).await
         );
-        let frame: serde_json::Value =
-            serde_json::from_str(&live_rx.recv().await.unwrap()).unwrap();
+        let broadcast = live_rx.recv().await.unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&broadcast.message).unwrap();
         assert_eq!(frame["kind"], "pending_resolved");
         assert_eq!(frame["resolution"], "accepted");
         assert_eq!(pending.lock().await.entries.len(), 0);

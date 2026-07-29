@@ -232,9 +232,9 @@ pub(super) async fn follow_forever(
     network: Network,
     rpc: Option<String>,
     db: std::path::PathBuf,
-    delivery_tx: tokio::sync::broadcast::Sender<std::sync::Arc<kascov_core::DeliveryRecord>>,
+    delivery_tx: tokio::sync::broadcast::Sender<std::sync::Arc<crate::stream::AcceptedBroadcast>>,
     hook_tx: tokio::sync::mpsc::Sender<HookEvent>,
-    pending_tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    pending_tx: tokio::sync::broadcast::Sender<std::sync::Arc<crate::stream::PendingBroadcast>>,
     pending: std::sync::Arc<tokio::sync::Mutex<crate::pending::PendingFeed>>,
     decoder: std::sync::Arc<dyn kascov_core::ApplicationDecoder>,
     health: std::sync::Arc<SyncHealth>,
@@ -355,6 +355,12 @@ pub(super) async fn follow_forever(
             }
             loop {
                 let reconcile_started = now_ms();
+                let delivery_observed_at_ms = match trigger {
+                    performance::ReconcileTrigger::Notification { observed_at_ms } => {
+                        Some(observed_at_ms)
+                    }
+                    _ => None,
+                };
                 health.last_reconciliation_start_ms.store(
                     reconcile_started as i64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -383,7 +389,12 @@ pub(super) async fn follow_forever(
                         health.record_delivery_cursor(record.cursor);
                         let record = std::sync::Arc::new(record);
                         if delivery_tx.receiver_count() > 0 {
-                            let _ = delivery_tx.send(record.clone());
+                            let _ = delivery_tx.send(std::sync::Arc::new(
+                                crate::stream::AcceptedBroadcast {
+                                    record: record.clone(),
+                                    observed_at_ms: delivery_observed_at_ms,
+                                },
+                            ));
                         }
                         if webhook {
                             accepted_txids.insert(record.txid);

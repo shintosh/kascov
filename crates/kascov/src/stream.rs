@@ -34,9 +34,30 @@ const DELIVERY_BUFFER: usize = 1024;
 /// Best-effort pending frames stay isolated from durable accepted delivery.
 const PENDING_BUFFER: usize = 256;
 
+#[derive(Debug)]
+pub(super) struct AcceptedBroadcast {
+    pub(super) record: std::sync::Arc<kascov_core::DeliveryRecord>,
+    pub(super) observed_at_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingBroadcast {
+    pub(super) message: std::sync::Arc<str>,
+    pub(super) observed_at_ms: u64,
+}
+
+impl PendingBroadcast {
+    pub(super) fn new(message: String, observed_at_ms: u64) -> Self {
+        Self {
+            message: message.into(),
+            observed_at_ms,
+        }
+    }
+}
+
 /// One network's post-commit accepted-record fan-out.
 pub(super) struct DeliveryHub {
-    pub(super) tx: tokio::sync::broadcast::Sender<std::sync::Arc<kascov_core::DeliveryRecord>>,
+    pub(super) tx: tokio::sync::broadcast::Sender<std::sync::Arc<AcceptedBroadcast>>,
     subscribers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     max_subscribers: usize,
     replays: std::sync::Arc<tokio::sync::Semaphore>,
@@ -87,7 +108,7 @@ impl DeliveryHub {
 /// One network's process-local pending fan-out. Pending frames never carry a
 /// durable cursor or consume accepted delivery capacity.
 pub(super) struct PendingHub {
-    pub(super) tx: tokio::sync::broadcast::Sender<std::sync::Arc<str>>,
+    pub(super) tx: tokio::sync::broadcast::Sender<std::sync::Arc<PendingBroadcast>>,
 }
 
 impl PendingHub {
@@ -319,9 +340,12 @@ fn apply_stream_headers(response: &mut axum::response::Response) {
 }
 
 enum StreamFrame {
-    Delivery(std::sync::Arc<kascov_core::DeliveryRecord>),
+    Delivery {
+        record: std::sync::Arc<kascov_core::DeliveryRecord>,
+        observed_at_ms: Option<u64>,
+    },
     Checkpoint(kascov_core::StreamCursor),
-    Pending(std::sync::Arc<str>),
+    Pending(std::sync::Arc<PendingBroadcast>),
 }
 
 struct ReplayState {
@@ -332,8 +356,8 @@ struct ReplayState {
 }
 
 struct DurableStreamState {
-    delivery_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<kascov_core::DeliveryRecord>>,
-    pending_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<str>>,
+    delivery_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<AcceptedBroadcast>>,
+    pending_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<PendingBroadcast>>,
     _slot: SubscriberSlot,
     filter: kascov_core::store_delivery::DeliveryFilter,
     performance: std::sync::Arc<kascov_core::performance::PerformanceMetrics>,
@@ -407,9 +431,10 @@ async fn next_stream_frame(
                 for record in page {
                     if delivery_matches(&record, &state.filter) {
                         replay.last_emitted = record.cursor;
-                        state
-                            .queued
-                            .push_back(StreamFrame::Delivery(std::sync::Arc::new(record)));
+                        state.queued.push_back(StreamFrame::Delivery {
+                            record: std::sync::Arc::new(record),
+                            observed_at_ms: None,
+                        });
                     }
                 }
                 replay.cursor = scanned_to;
@@ -427,22 +452,25 @@ async fn next_stream_frame(
         tokio::select! {
             delivery = state.delivery_rx.recv() => match delivery {
                 Ok(record) => {
-                    if record.cursor.epoch == state.discard_through.epoch
-                        && record.cursor.seq <= state.discard_through.seq
+                    if record.record.cursor.epoch == state.discard_through.epoch
+                        && record.record.cursor.seq <= state.discard_through.seq
                     {
                         continue;
                     }
-                    if delivery_matches(&record, &state.filter) {
+                    if delivery_matches(&record.record, &state.filter) {
                         state.live_checkpoint = None;
                         state.live_checkpoint_count = 0;
-                        return Some((StreamFrame::Delivery(record), state));
+                        return Some((StreamFrame::Delivery {
+                            record: record.record.clone(),
+                            observed_at_ms: record.observed_at_ms,
+                        }, state));
                     }
                     if state.filter != Default::default() {
                         if state.live_checkpoint.is_none() {
                             state.live_checkpoint_at = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(1);
                         }
-                        state.live_checkpoint = Some(record.cursor);
+                        state.live_checkpoint = Some(record.record.cursor);
                         state.live_checkpoint_count = state.live_checkpoint_count.saturating_add(1);
                         if state.live_checkpoint_count >= state.replay_page_size as u16 {
                             state.live_checkpoint_count = 0;
@@ -458,7 +486,7 @@ async fn next_stream_frame(
             },
             pending = state.pending_rx.recv() => match pending {
                 Ok(message) => {
-                    if pending_matches(&message, &state.filter) {
+                    if pending_matches(&message.message, &state.filter) {
                         return Some((StreamFrame::Pending(message), state));
                     }
                 }
@@ -483,7 +511,7 @@ fn stream_frame_event(
     use axum::response::sse::Event;
 
     match frame {
-        StreamFrame::Delivery(record) => {
+        StreamFrame::Delivery { record, .. } => {
             let bytes = serde_json::to_vec(&*record).map_err(|_| "delivery JSON encoding failed")?;
             if bytes.len() > MAX_STREAM_EVENT_BYTES {
                 return Err("delivery exceeds the stream event byte limit");
@@ -506,7 +534,35 @@ fn stream_frame_event(
                 "cursor": cursor,
             }))
             .ok()),
-        StreamFrame::Pending(message) => Ok(pending_sse_event(&message)),
+        StreamFrame::Pending(message) => Ok(pending_sse_event(&message.message)),
+    }
+}
+
+fn frame_delivery_observation(
+    frame: &StreamFrame,
+) -> Option<(kascov_core::performance::Stage, u64)> {
+    use kascov_core::performance::Stage;
+
+    match frame {
+        StreamFrame::Delivery {
+            observed_at_ms: Some(observed_at_ms),
+            ..
+        } => Some((Stage::AcceptedDelivery, *observed_at_ms)),
+        StreamFrame::Pending(message) => Some((Stage::PendingDelivery, message.observed_at_ms)),
+        _ => None,
+    }
+}
+
+fn record_delivery_observation(
+    observation: Option<(kascov_core::performance::Stage, u64)>,
+    metrics: &kascov_core::performance::PerformanceMetrics,
+    yielded_at_ms: u64,
+) {
+    if let Some((stage, observed_at_ms)) = observation {
+        metrics.record(
+            stage,
+            std::time::Duration::from_millis(yielded_at_ms.saturating_sub(observed_at_ms)),
+        );
     }
 }
 
@@ -668,14 +724,15 @@ pub(super) async fn stream_handler(
         loop {
             let (frame, next_state) = next_stream_frame(state).await?;
             state = next_state;
-            let event = {
-                let _delivery = state
-                    .performance
-                    .timer(kascov_core::performance::Stage::StreamDelivery);
-                stream_frame_event(frame)
-            };
+            let observation = frame_delivery_observation(&frame);
+            let event = stream_frame_event(frame);
             match event {
                 Ok(Some(event)) => {
+                    // The frame is now ready to yield to Axum's response body.
+                    // Replay has no node observation timestamp and is omitted.
+                    // Live paths record their end-to-end observation delay.
+                    // The event value is built, so this point includes encoding.
+                    record_delivery_observation(observation, &state.performance, now_ms());
                     return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
                 Ok(None) => {}
@@ -874,6 +931,44 @@ mod tests {
         assert!(!wire.lines().any(|line| line.starts_with("id:")));
     }
 
+    #[test]
+    fn live_frame_observations_record_separate_delivery_latency() {
+        use kascov_core::performance::{PerformanceMetrics, Stage};
+
+        let metrics = PerformanceMetrics::new();
+        let accepted = StreamFrame::Delivery {
+            record: std::sync::Arc::new(kascov_core::DeliveryRecord {
+                cursor: "00112233445566778899aabbccddeeff:1".parse().unwrap(),
+                kind: kascov_core::DeliveryKind::Accepted,
+                source_cursor: None,
+                covenant_id: CovenantId([1; 32]),
+                covenant_event_seq: 1,
+                txid: TxId([2; 32]),
+                accepting_block: BlockHash([3; 32]),
+                accepting_daa: 4,
+                tx_index: Some(0),
+                event_index: Some(0),
+                order_complete: true,
+                pending_id: None,
+                applications: vec![],
+            }),
+            observed_at_ms: Some(100),
+        };
+        let pending = StreamFrame::Pending(std::sync::Arc::new(PendingBroadcast::new(
+            r#"{"kind":"pending"}"#.into(),
+            200,
+        )));
+
+        record_delivery_observation(frame_delivery_observation(&accepted), &metrics, 105);
+        record_delivery_observation(frame_delivery_observation(&pending), &metrics, 211);
+        record_delivery_observation(None, &metrics, 999);
+
+        assert_eq!(1, metrics.snapshot(Stage::AcceptedDelivery).count);
+        assert_eq!(5_000, metrics.snapshot(Stage::AcceptedDelivery).total_us);
+        assert_eq!(1, metrics.snapshot(Stage::PendingDelivery).count);
+        assert_eq!(11_000, metrics.snapshot(Stage::PendingDelivery).total_us);
+    }
+
     fn accepted_batch(block: u8, events: u32) -> kascov_core::store::AcceptedBlockBatch {
         use kascov_core::store::{AcceptedBlockBatch, EventKind, NewEvent};
 
@@ -894,12 +989,21 @@ mod tests {
         batch
     }
 
+    fn accepted_broadcast(
+        record: kascov_core::DeliveryRecord,
+    ) -> std::sync::Arc<AcceptedBroadcast> {
+        std::sync::Arc::new(AcceptedBroadcast {
+            record: std::sync::Arc::new(record),
+            observed_at_ms: Some(now_ms()),
+        })
+    }
+
     fn replay_state(
         path: std::path::PathBuf,
         after: kascov_core::StreamCursor,
         through: kascov_core::StreamCursor,
-        delivery_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<kascov_core::DeliveryRecord>>,
-        pending_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<str>>,
+        delivery_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<AcceptedBroadcast>>,
+        pending_rx: tokio::sync::broadcast::Receiver<std::sync::Arc<PendingBroadcast>>,
         filter: kascov_core::store_delivery::DeliveryFilter,
     ) -> DurableStreamState {
         DurableStreamState {
@@ -960,17 +1064,17 @@ mod tests {
 
         let (first, next) = next_stream_frame(state).await.unwrap();
         state = next;
-        assert!(matches!(first, StreamFrame::Delivery(ref record) if record.cursor.seq == 1));
+        assert!(matches!(first, StreamFrame::Delivery { ref record, .. } if record.cursor.seq == 1));
 
         let committed = store.apply_accepted_block(&accepted_batch(2, 1)).unwrap();
         delivery_tx
-            .send(std::sync::Arc::new(committed.deliveries[0].clone()))
+            .send(accepted_broadcast(committed.deliveries[0].clone()))
             .unwrap();
         let mut sequences = vec![1];
         while sequences.len() < 514 {
             let (frame, next) = next_stream_frame(state).await.unwrap();
             state = next;
-            if let StreamFrame::Delivery(record) = frame {
+            if let StreamFrame::Delivery { record, .. } = frame {
                 sequences.push(record.cursor.seq);
             }
         }
@@ -1047,7 +1151,7 @@ mod tests {
                 pending_id: None,
                 applications: vec![],
             };
-            delivery_tx.send(std::sync::Arc::new(record)).unwrap();
+            delivery_tx.send(accepted_broadcast(record)).unwrap();
         }
         let mut state = replay_state(
             path.clone(),
@@ -1075,7 +1179,7 @@ mod tests {
         let (delivery_tx, delivery_rx) = tokio::sync::broadcast::channel(2);
         let (_pending_tx, pending_rx) = tokio::sync::broadcast::channel(2);
         delivery_tx
-            .send(std::sync::Arc::new(kascov_core::DeliveryRecord {
+            .send(accepted_broadcast(kascov_core::DeliveryRecord {
                 cursor: kascov_core::StreamCursor {
                     epoch: current.epoch,
                     seq: 1,

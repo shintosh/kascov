@@ -15,11 +15,12 @@ pub enum Stage {
     Publication = 4,
     Query = 5,
     Serialization = 6,
-    StreamDelivery = 7,
+    AcceptedDelivery = 7,
+    PendingDelivery = 8,
 }
 
 impl Stage {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Reconciliation,
         Self::BodyResolution,
         Self::Classification,
@@ -27,7 +28,8 @@ impl Stage {
         Self::Publication,
         Self::Query,
         Self::Serialization,
-        Self::StreamDelivery,
+        Self::AcceptedDelivery,
+        Self::PendingDelivery,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -39,7 +41,8 @@ impl Stage {
             Self::Publication => "publication",
             Self::Query => "query",
             Self::Serialization => "serialization",
-            Self::StreamDelivery => "stream_delivery",
+            Self::AcceptedDelivery => "accepted_delivery",
+            Self::PendingDelivery => "pending_delivery",
         }
     }
 }
@@ -206,7 +209,17 @@ mod tests {
         assert!(snapshot.p50_us >= 32);
         assert!(snapshot.p95_us >= 64);
         assert_eq!("commit", Stage::Commit.as_str());
-        assert_eq!(8, Stage::ALL.len());
+        assert_eq!(9, Stage::ALL.len());
+    }
+
+    #[test]
+    fn accepted_and_pending_delivery_have_separate_histograms() {
+        let metrics = PerformanceMetrics::new();
+        metrics.record(Stage::AcceptedDelivery, Duration::from_millis(3));
+        metrics.record(Stage::PendingDelivery, Duration::from_millis(7));
+
+        assert_eq!(1, metrics.snapshot(Stage::AcceptedDelivery).count);
+        assert_eq!(1, metrics.snapshot(Stage::PendingDelivery).count);
     }
 
     #[test]
