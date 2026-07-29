@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS application_outputs (
 CREATE INDEX IF NOT EXISTS application_output_by_current_actor
     ON application_outputs(application_id, actor_path, covenant_id)
     WHERE spent_block IS NULL;
+CREATE INDEX IF NOT EXISTS application_output_by_application
+    ON application_outputs(application_id);
 CREATE INDEX IF NOT EXISTS application_output_by_covenant
     ON application_outputs(covenant_id, created_daa);
 CREATE INDEX IF NOT EXISTS application_output_by_created
@@ -62,6 +64,10 @@ CREATE INDEX IF NOT EXISTS application_failure_unrepaired
     WHERE repaired_stream_seq IS NULL;
 CREATE INDEX IF NOT EXISTS application_failure_by_block
     ON application_decode_failures(accepting_block);
+CREATE INDEX IF NOT EXISTS application_failure_by_application
+    ON application_decode_failures(application_id);
+CREATE INDEX IF NOT EXISTS application_failure_by_transaction
+    ON application_decode_failures(txid, application_id);
 
 CREATE TABLE IF NOT EXISTS application_decode_failure_counts (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -516,16 +522,24 @@ impl Store {
         after_id: u64,
         limit: u64,
     ) -> Result<Vec<StoredDecodeFailure>> {
+        let query = if application_id.is_some() {
+            "SELECT id, txid, accepting_block, accepting_daa, output_index,
+                    application_id, artifact_id, code, detail,
+                    repaired_stream_seq
+             FROM application_decode_failures
+             WHERE application_id = ?1 AND id > ?2
+             ORDER BY id LIMIT ?3"
+        } else {
+            "SELECT id, txid, accepting_block, accepting_daa, output_index,
+                    application_id, artifact_id, code, detail,
+                    repaired_stream_seq
+             FROM application_decode_failures
+             WHERE ?1 IS NULL AND id > ?2
+             ORDER BY id LIMIT ?3"
+        };
         let mut statement = self
             .conn
-            .prepare(
-                "SELECT id, txid, accepting_block, accepting_daa, output_index,
-                        application_id, artifact_id, code, detail,
-                        repaired_stream_seq
-                 FROM application_decode_failures
-                 WHERE (?1 IS NULL OR application_id = ?1) AND id > ?2
-                 ORDER BY id LIMIT ?3",
-            )
+            .prepare(query)
             .map_err(db_err)?;
         let rows = statement
             .query_map(
@@ -1042,6 +1056,48 @@ mod tests {
             .application_decode_failures_page(Some("other"), 0, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn public_application_queries_use_application_scoped_indexes() {
+        let path = std::env::temp_dir().join(format!(
+            "kascov-application-query-plans-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path, Network::Testnet(10)).unwrap();
+        let plans = [
+            (
+                "EXPLAIN QUERY PLAN SELECT rowid FROM application_outputs \
+                 WHERE application_id = 'duel' AND rowid > 0 ORDER BY rowid LIMIT 501",
+                "application_output_by_application",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT id FROM application_decode_failures \
+                 WHERE application_id = 'duel' AND id > 0 ORDER BY id LIMIT 501",
+                "application_failure_by_application",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT id FROM application_decode_failures \
+                 WHERE txid = zeroblob(32) AND application_id = 'duel' ORDER BY id LIMIT 1000",
+                "application_failure_by_transaction",
+            ),
+        ];
+
+        for (query, expected_index) in plans {
+            let details: Vec<String> = store
+                .conn
+                .prepare(query)
+                .unwrap()
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "{query} did not use {expected_index}: {details:?}"
+            );
+        }
     }
 
     struct RepairDecoder(ApplicationOutput);
