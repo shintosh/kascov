@@ -143,8 +143,13 @@ impl SyncHealth {
         (value > 0).then_some(value)
     }
 
+    pub(super) fn health_timestamps(&self) -> (Option<i64>, i64) {
+        let last_ok = self.last_sync_ok_ms();
+        (last_ok, last_ok.unwrap_or(self.boot_ms))
+    }
+
     pub(super) fn stall_reference_ms(&self) -> i64 {
-        self.last_sync_ok_ms().unwrap_or(self.boot_ms)
+        self.health_timestamps().1
     }
 
     pub(super) fn record_sync_ok(&self, at_ms: i64) {
@@ -233,6 +238,7 @@ mod sync_health_tests {
 
         assert_eq!(Some(1_250), health.last_sync_ok_ms());
         assert_eq!(1_250, health.stall_reference_ms());
+        assert_eq!((Some(1_250), 1_250), health.health_timestamps());
     }
 
     #[test]

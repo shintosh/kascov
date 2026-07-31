@@ -2405,6 +2405,7 @@ async fn healthz_handler(
             .iter()
             .find(|(n, _)| *n == network)
             .map(|(_, h)| {
+                let (last_ok, stall_reference) = h.health_timestamps();
                 (
                     h.last_node_notification_ms
                         .load(std::sync::atomic::Ordering::Relaxed),
@@ -2412,9 +2413,10 @@ async fn healthz_handler(
                         .load(std::sync::atomic::Ordering::Relaxed),
                     h.notification_to_reconciliation_ms
                         .load(std::sync::atomic::Ordering::Relaxed),
-                    h.last_sync_ok_ms(),
-                    h.stall_reference_ms(),
-                    h.last_progress_ms.load(std::sync::atomic::Ordering::Relaxed),
+                    last_ok,
+                    stall_reference,
+                    h.last_progress_ms
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     h.delivery_cursor(),
                 )
             })
