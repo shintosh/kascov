@@ -148,10 +148,6 @@ impl SyncHealth {
         (last_ok, last_ok.unwrap_or(self.boot_ms))
     }
 
-    pub(super) fn stall_reference_ms(&self) -> i64 {
-        self.health_timestamps().1
-    }
-
     pub(super) fn record_sync_ok(&self, at_ms: i64) {
         self.last_sync_ok_ms
             .store(at_ms, std::sync::atomic::Ordering::Relaxed);
@@ -232,12 +228,11 @@ mod sync_health_tests {
             serde_json::Value::Null,
             serde_json::json!(health.last_sync_ok_ms())
         );
-        assert_eq!(1_000, health.stall_reference_ms());
+        assert_eq!((None, 1_000), health.health_timestamps());
 
         health.record_sync_ok(1_250);
 
         assert_eq!(Some(1_250), health.last_sync_ok_ms());
-        assert_eq!(1_250, health.stall_reference_ms());
         assert_eq!((Some(1_250), 1_250), health.health_timestamps());
     }
 
