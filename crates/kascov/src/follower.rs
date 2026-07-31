@@ -101,9 +101,9 @@ where
     }
 }
 
-/// Per-network follower liveness, shared with /healthz. Epoch ms; both fields
-/// initialized to boot time so a fresh instance gets the same 10-minute grace
-/// as a healthy one.
+/// Per-network follower liveness, shared with /healthz. The stall reference
+/// starts at boot time for the 10-minute grace. The last successful sync stays
+/// absent until the follower completes its first successful pass.
 pub(super) struct SyncHealth {
     boot_ms: i64,
     /// Most recent virtual-chain notification observed from the node.
