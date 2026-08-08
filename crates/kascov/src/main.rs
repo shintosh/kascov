@@ -2147,7 +2147,7 @@ async fn serve(
                         };
                         let built =
                             tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                                let store = kascov_core::store::Store::open(&db, network)?;
+                                let store = kascov_core::store::Store::open_reader(&db, network)?;
                                 build_galaxy_json(&store, network, fmt)
                             })
                             .await;
@@ -4099,7 +4099,7 @@ async fn registry_handler(
     let read_pool = read_pool_for(&state, network);
     let db2 = state.base_dir.join(format!("{network}.db"));
     let built = tokio::task::spawn_blocking(move || -> Result<String> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         prove_listed_vesting_schedules(&store, &entries)?;
         let mut checked = Vec::with_capacity(entries.len());
         for entry in &entries {
@@ -4542,13 +4542,14 @@ async fn data_handler(
         cache_control,
         accepts_gzip(&headers),
         move || {
-            let store = kascov_core::store::Store::open(&db, network)?;
+            Ok(read_pool.query(|store| {
             let snapshot = if live {
                 build_live_snapshot(&store, network)?
             } else {
                 build_grid_snapshot(&store, network, after, limit)?
             };
             Ok(Some(serde_json::to_string(&snapshot)?))
+            })?)
         },
     )
     .await
@@ -4738,9 +4739,7 @@ async fn events_handler(
     };
     let read_pool = read_pool_for(&state, network);
     match tokio::task::spawn_blocking(move || {
-        let store = kascov_core::store::Store::open_read_only(&db, network)?;
-        events_page_json(&store, network, &request)
-
+        read_pool.query_with(|store| events_page_json(store, network, &request))
     })
     .await
     {
@@ -5716,12 +5715,12 @@ async fn verification_handler(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let bench_path = state.base_dir.join(format!("{network}.bench.json"));
     let key = format!("{network}/verification");
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let runs = store.derivation_runs(50)?;
         let unknown = store.unknown_builds(50)?;
         let (unknown_programs, unknown_covenants) = store.unknown_build_totals()?;
@@ -5743,6 +5742,7 @@ async fn verification_handler(
             "unknown_note": "programs kascov could not match to an audited build. a to-audit list ranked by how much activity rides on each, never a trust ranking: nothing here has proven anything, and none of it is priced.",
             "audit_bench": audit_bench,
         }))?))
+        })?)
     })
     .await
 }
@@ -5770,7 +5770,7 @@ async fn tokens_handler(
     );
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        let store = kascov_core::store::Store::open_reader(&db, network)?;
         let mut tokens: Vec<(u64, String, &'static str, serde_json::Value)> = Vec::new();
         for t in store.token_directory()? {
             let claimed = store.claimed_token_meta(&t.token_id)?;
@@ -5932,7 +5932,7 @@ async fn token_trades_handler(
     );
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        let store = kascov_core::store::Store::open_reader(&db, network)?;
         if store.token_row(&token_id)?.is_none() {
             return Ok(None);
         }
@@ -6045,7 +6045,7 @@ async fn token_handler(
                 .into_response()
         }
     };
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let key = format!(
         "{network}/token/{token_id}?limit={limit}&after_seq={}&before_seq={}&desc={newest_first}&events_limit={events_limit}",
         after_seq.map_or(String::new(), |s| s.to_string()),
@@ -6400,7 +6400,7 @@ async fn token_candles_handler(
     let key = format!("{network}/token/{token_id}/candles/{bucket_label}");
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 30, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        let store = kascov_core::store::Store::open_reader(&db, network)?;
         let Some(row) = store.token_row(&token_id)? else {
             return Ok(None); // uncached 404: not a token the derivation knows
         };
@@ -6492,7 +6492,7 @@ async fn token_curve_cell_handler(
     // Short TTL: the live cell moves with every trade.
     let cc = "public, max-age=5, s-maxage=10, stale-while-revalidate=30";
     serve_cached(&state, key, 5, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        let store = kascov_core::store::Store::open_reader(&db, network)?;
         let Some(token) = store.token_row(&token_id)? else {
             return Ok(None);
         };
@@ -6571,7 +6571,7 @@ async fn token_book_handler(
         // the read-only connection below looks for it. The Store API has no
         // book reader yet; until it grows one, this endpoint reads the table
         // directly, read-only, through params.
-        let _schema = kascov_core::store::Store::open(&db, network)?;
+        let _schema = kascov_core::store::Store::open_reader(&db, network)?;
         let conn = rusqlite::Connection::open_with_flags(
             &db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -7789,7 +7789,7 @@ async fn verified_handler(
     let hash = hash.trim_end_matches(".json").to_lowercase();
     let got = tokio::task::spawn_blocking(
         move || -> anyhow::Result<Option<(String, String, Option<String>, u64)>> {
-            Ok(kascov_core::store::Store::open(&db, network)?.get_verified_source(&hash)?)
+            Ok(read_pool.query(|store| Ok(store.get_verified_source(&hash)?))?)
         },
     )
     .await;
@@ -8146,7 +8146,7 @@ async fn lifespans_handler(
         cc,
         accepts_gzip(&headers),
         move || {
-            let store = kascov_core::store::Store::open(&db, network)?;
+            Ok(read_pool.query(|store| {
             let (buckets, median_daa, total) = store.lifespan_stats()?;
             let items: Vec<_> = buckets
                 .into_iter()
@@ -8160,6 +8160,7 @@ async fn lifespans_handler(
                 "median_ms": median_daa * 100, // 10 DAA ≈ 1 s
                 "total": total,
             }))?))
+            })?)
         },
     )
     .await
@@ -8211,7 +8212,7 @@ async fn lanes_handler(
         cc,
         accepts_gzip(&headers),
         move || {
-            let store = kascov_core::store::Store::open(&db, network)?;
+            Ok(read_pool.query(|store| {
             let mut json_events = 0u64;
             let mut json_coins = 0u64;
             let mut lanes: Vec<serde_json::Value> = Vec::new();
@@ -8280,6 +8281,7 @@ async fn lanes_handler(
                 "tip_daa": tip.map(|t| t.0),
                 "lanes": lanes,
             }))?))
+            })?)
         },
     )
     .await
@@ -8303,10 +8305,11 @@ async fn families_handler(
         cc,
         accepts_gzip(&headers),
         move || {
-            let store = kascov_core::store::Store::open(&db, network)?;
+            Ok(read_pool.query(|store| {
             Ok(Some(serde_json::to_string(&build_families(
                 &store, network,
             )?)?))
+            })?)
         },
     )
     .await
@@ -8332,7 +8335,7 @@ async fn reorgs_handler(
         cc,
         accepts_gzip(&headers),
         move || {
-            let store = kascov_core::store::Store::open(&db, network)?;
+            Ok(read_pool.query(|store| {
             let reorgs = store.reorg_log(500)?;
             let out = serde_json::json!({
                 "network": network.to_string(),
@@ -8340,6 +8343,7 @@ async fn reorgs_handler(
                 "reorgs": reorgs,
             });
             Ok(Some(serde_json::to_string(&out)?))
+            })?)
         },
     )
     .await
@@ -9048,9 +9052,9 @@ async fn og_card_handler(
     let listed = registry_list_cached()
         .await
         .and_then(|body| listed_display_line(&body, network, &covenant_id));
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let result = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let Some(summary) = store.summary(&covenant_id)? else {
             return Ok(None);
         };
@@ -9074,7 +9078,8 @@ async fn og_card_handler(
             started.elapsed().as_millis()
         );
         Ok(Some(png))
-    }))
+        })?)
+    })
     .await;
     match result {
         Ok(Ok(Some(png))) => (
@@ -9271,9 +9276,9 @@ async fn share_handler(
     let listed = registry_list_cached()
         .await
         .and_then(|body| listed_display_line(&body, network, &covenant_id));
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let Some(summary) = store.summary(&covenant_id)? else {
             // Not a covenant kascov knows — the same 64 hex chars may name a
             // transaction, which gets its own permalink shell.
@@ -9305,7 +9310,8 @@ async fn share_handler(
             &app,
             &body_extra,
         )))
-    }))
+        })?)
+    })
     .await;
     match result {
         Ok(Ok(Some(html))) => (
@@ -9773,10 +9779,9 @@ async fn digest_handler(
     let key = format!("{network}/digest");
     let cc = "public, max-age=60, s-maxage=300, stale-while-revalidate=600";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        Ok(Some(serde_json::to_string(&build_digest(
+        Ok(read_pool.query(|store| Ok(Some(serde_json::to_string(&build_digest(
             &store, network,
-        )?)?))
+        )?)?)))?)
     })
     .await
 }
@@ -9798,10 +9803,9 @@ async fn templates_handler(
     let key = format!("{network}/templates");
     let cc = "public, max-age=30, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 60, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        Ok(Some(serde_json::to_string(&build_templates_snapshot(
+        Ok(read_pool.query(|store| Ok(Some(serde_json::to_string(&build_templates_snapshot(
             &store, network,
-        )?)?))
+        )?)?)))?)
     })
     .await
 }
@@ -9842,10 +9846,9 @@ async fn activity_handler(
     let key = format!("{network}/activity/{range}");
     let cc = "public, max-age=15, s-maxage=60, stale-while-revalidate=300";
     serve_cached(&state, key, 30, cc, accepts_gzip(&headers), move || {
-        let store = kascov_core::store::Store::open(&db, network)?;
-        Ok(Some(serde_json::to_string(&build_activity_snapshot(
+        Ok(read_pool.query(|store| Ok(Some(serde_json::to_string(&build_activity_snapshot(
             &store, network, range,
-        )?)?))
+        )?)?)))?)
     })
     .await
 }
@@ -10067,9 +10070,9 @@ async fn prove_holding_handler(
             Err(reason) => return refuse(reason),
         };
 
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let holdings = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        Ok(read_pool.query(|store| {
         let rows: Vec<serde_json::Value> = store
             .token_holdings_for_pubkey(&pubkey)?
             .into_iter()
@@ -10085,6 +10088,7 @@ async fn prove_holding_handler(
             })
             .collect();
         Ok(serde_json::json!({ "holdings": rows, "tip_daa": store.tip()?.map(|t| t.0) }))
+        })?)
     })
     .await;
 
@@ -10347,7 +10351,7 @@ async fn lane_mint_handler(
     // the gate itself: does the proven key hold KASCOV on this network?
     let db = state.base_dir.join(format!("{network}.db"));
     let held = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
-        let store = kascov_core::store::Store::open(&db, network)?;
+        let store = kascov_core::store::Store::open_reader(&db, network)?;
         Ok(store
             .token_holdings_for_pubkey(&pubkey)?
             .into_iter()
@@ -10815,7 +10819,7 @@ async fn search_handler(
     // uses. Fetched here, outside spawn_blocking, because the loader is
     // async; most of the time this is a lock-and-clone of the cached body.
     let listed_body = registry_list_cached().await;
-    let db = state.base_dir.join(format!("{network}.db"));
+    let read_pool = read_pool_for(&state, network);
     let state2 = state.clone();
     let built = tokio::task::spawn_blocking(move || read_pool.query(|store| {
         use kascov_core::store::CovenantSummary;
@@ -12656,7 +12660,7 @@ mod shell_meta_tests {
 #[cfg(test)]
 mod search_listed_tests {
     use super::*;
-    use kascov_core::store::{BlockEvents, EventKind, NewEvent, Store};
+    use kascov_core::store::{AcceptedBlockBatch, EventKind, NewEvent, Store};
 
     const LISTED_ID: [u8; 32] = [0xB7; 32];
 
@@ -12689,8 +12693,7 @@ mod search_listed_tests {
         let _ = std::fs::remove_file(&path);
         let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
         store
-            .apply(
-                &BlockEvents {
+            .apply_accepted_block(&AcceptedBlockBatch {
                     accepting_block: BlockHash([1; 32]),
                     accepting_daa: 1_000,
                     accepting_time_ms: 1_700_000_000_000,
@@ -12700,13 +12703,14 @@ mod search_listed_tests {
                         kind: EventKind::Genesis,
                         txid: TxId([0x10; 32]),
                         tx_index: 0,
+                        event_index: 0,
                         payload: None,
                         lane_namespace: None,
                     }],
                     created_utxos: vec![],
                     spent_utxos: vec![],
+                    transactions: vec![],
                 },
-                BlockHash([1; 32]),
             )
             .unwrap();
 
@@ -12738,7 +12742,7 @@ mod search_listed_tests {
 #[cfg(test)]
 mod share_identity_tests {
     use super::*;
-    use kascov_core::store::{BlockEvents, EventKind, NewEvent, Store};
+    use kascov_core::store::{AcceptedBlockBatch, EventKind, NewEvent, Store};
 
     #[test]
     fn share_name_precedence_is_claimed_then_listed_then_codename() {
@@ -12849,8 +12853,7 @@ mod share_identity_tests {
         let _ = std::fs::remove_file(&path);
         let mut store = Store::open(&path, Network::Testnet(10)).unwrap();
         store
-            .apply(
-                &BlockEvents {
+            .apply_accepted_block(&AcceptedBlockBatch {
                     accepting_block: BlockHash([1; 32]),
                     accepting_daa: 1_000,
                     accepting_time_ms: 1_700_000_000_000,
@@ -12860,13 +12863,14 @@ mod share_identity_tests {
                         kind: EventKind::Genesis,
                         txid: TxId(txid),
                         tx_index: 0,
+                        event_index: 0,
                         payload: None,
                         lane_namespace: None,
                     }],
                     created_utxos: vec![],
                     spent_utxos: vec![],
+                    transactions: vec![],
                 },
-                BlockHash([1; 32]),
             )
             .unwrap();
         (path, store)

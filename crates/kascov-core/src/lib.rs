@@ -12,7 +12,6 @@ pub mod store_application;
 pub mod store_delivery;
 pub mod sync;
 mod writer;
-pub mod market;
 
 pub mod tokens;
 

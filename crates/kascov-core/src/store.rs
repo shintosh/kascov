@@ -1471,7 +1471,6 @@ impl Store {
             .map_err(db_err)?;
         conn.pragma_update(None, "wal_autocheckpoint", wal_autocheckpoint())
             .map_err(db_err)?;
-            .map_err(db_err)?;
         // Concurrent readers (backup, serve snapshots) must wait out write
         // bursts instead of failing with SQLITE_BUSY.
         conn.busy_timeout(std::time::Duration::from_secs(10))
@@ -2299,15 +2298,20 @@ impl Store {
             let mut kcc1_hash: Option<[u8; 32]> = None;
             let revealed: Option<String> = tx
                 .query_row(
-                    "SELECT spk_version, spk_script FROM covenant_utxos
+                    "SELECT spk_version, spk_script, covenant_id FROM covenant_utxos
                      WHERE txid = ?1 AND output_index = ?2",
                     params![outpoint.txid.0.as_slice(), outpoint.index],
-                    |r| Ok((r.get::<_, u16>(0)?, r.get::<_, Vec<u8>>(1)?)),
-
+                    |r| {
+                        Ok((
+                            r.get::<_, u16>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, [u8; 32]>(2)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(db_err)?
-                .map(|(version, spk)| {
+                .map(|(version, spk, covenant_id)| {
                     let redeem = kascov_decode::p2sh_reveal(&spk, sig);
                     kcc1_hash = redeem
                         .as_deref()
@@ -6841,6 +6845,7 @@ mod tests {
                     event_index: 0,
                     payload: None,
                     lane_namespace: None,
+                },
             ],
             created_utxos: vec![],
             spent_utxos: vec![],
